@@ -780,7 +780,7 @@ function createServer({ config }: { config?: any } = {}) {
   )
 
   server.tool("crm_get_contact_properties",
-    "Get all properties for contacts",
+    "Get schema definitions of all contact properties in the HubSpot portal (NOTE: DO NOT use this tool to read values of a single contact; to get an individual contact's values, use crm_get_contact with properties parameter)",
     {
       archived: z.boolean().optional(),
       properties: z.array(z.string()).optional()
@@ -788,10 +788,21 @@ function createServer({ config }: { config?: any } = {}) {
     async (params) => {
       return handleEndpoint(async () => {
         const endpoint = '/crm/v3/properties/contacts'
-        return await makeApiRequestWithErrorHandling(hubspotAccessToken, endpoint, {
+        const res: any = await makeApiRequestWithErrorHandling(hubspotAccessToken, endpoint, {
           archived: params.archived,
           properties: params.properties?.join(',')
         })
+        if (res && Array.isArray(res.results)) {
+          const simplified = res.results.map((p: any) => ({
+            name: p.name,
+            label: p.label,
+            type: p.type,
+            fieldType: p.fieldType,
+            description: p.description
+          }))
+          return { total: simplified.length, properties: simplified }
+        }
+        return res
       })
     }
   )
@@ -1777,9 +1788,21 @@ function createServer({ config }: { config?: any } = {}) {
   )
 
   server.tool("engagement_details_get_associated",
-    "Get all engagements associated with an object",
+    "Get all engagements/activities (calls, emails, meetings, notes, tasks) associated with an object",
     {
-      objectType: z.enum(['CONTACT', 'COMPANY', 'DEAL', 'TICKET']),
+      objectType: z.preprocess(
+        (val) => {
+          if (typeof val === 'string') {
+            const upper = val.trim().toUpperCase();
+            if (upper.startsWith('CONTACT')) return 'CONTACT';
+            if (upper.startsWith('COMPAN')) return 'COMPANY';
+            if (upper.startsWith('DEAL')) return 'DEAL';
+            if (upper.startsWith('TICKET')) return 'TICKET';
+          }
+          return val;
+        },
+        z.enum(['CONTACT', 'COMPANY', 'DEAL', 'TICKET'])
+      ),
       objectId: z.string(),
       startTime: z.string().optional(),
       endTime: z.string().optional(),
