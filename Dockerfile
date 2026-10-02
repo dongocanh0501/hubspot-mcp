@@ -3,8 +3,8 @@ FROM node:20-alpine AS builder
 
 WORKDIR /build
 
-# Install pnpm
-RUN npm install -g pnpm
+# Install pnpm v9 to prevent pnpm 10 build script rejection
+RUN npm install -g pnpm@9
 
 # Copy package manifests
 COPY package.json pnpm-lock.yaml tsconfig.json ./
