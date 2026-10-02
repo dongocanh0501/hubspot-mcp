@@ -2594,6 +2594,55 @@ function createServer({ config }: { config?: any } = {}) {
     })
   )
 
+  // ==========================================
+  // Conversations API (Messenger / Live Chat)
+  // ==========================================
+
+  server.tool(
+    "conversations_get_thread_messages",
+    "Retrieve all messages from a conversation thread (e.g. Facebook Messenger, live chat, email) in HubSpot Inbox. Returns sender, text content, timestamps, and message direction.",
+    {
+      threadId: z.string().describe("The HubSpot conversation thread ID"),
+      limit: z.number().optional().describe("Maximum number of messages to return (max 100)"),
+      sort: z.enum(["ASCENDING", "DESCENDING"]).optional().describe("Sort messages by creation timestamp")
+    },
+    async (params) => handleEndpoint(async () => {
+      const endpoint = `/conversations/v3/conversations/threads/${params.threadId}/messages`
+      const queryParams: Record<string, any> = {}
+      if (params.limit !== undefined) queryParams.limit = params.limit
+      if (params.sort !== undefined) queryParams.sort = params.sort
+      return await makeApiRequestWithErrorHandling(hubspotAccessToken, endpoint, queryParams, 'GET')
+    })
+  )
+
+  server.tool(
+    "conversations_get_thread",
+    "Get details of a specific conversation thread including channel ID, associated contact ID, inbox ID, and status.",
+    {
+      threadId: z.string().describe("The HubSpot conversation thread ID")
+    },
+    async (params) => handleEndpoint(async () => {
+      const endpoint = `/conversations/v3/conversations/threads/${params.threadId}`
+      return await makeApiRequestWithErrorHandling(hubspotAccessToken, endpoint, {}, 'GET')
+    })
+  )
+
+  server.tool(
+    "conversations_list_threads",
+    "List conversation threads in HubSpot Conversations Inbox, optionally filtered by associated contact ID or status.",
+    {
+      associatedContactId: z.string().optional().describe("Filter threads by HubSpot associated contact ID"),
+      limit: z.number().optional().describe("Maximum number of threads to return (max 100)")
+    },
+    async (params) => handleEndpoint(async () => {
+      const endpoint = '/conversations/v3/conversations/threads'
+      const queryParams: Record<string, any> = {}
+      if (params.associatedContactId !== undefined) queryParams.associatedContactId = params.associatedContactId
+      if (params.limit !== undefined) queryParams.limit = params.limit
+      return await makeApiRequestWithErrorHandling(hubspotAccessToken, endpoint, queryParams, 'GET')
+    })
+  )
+
   return server.server
 }
 
