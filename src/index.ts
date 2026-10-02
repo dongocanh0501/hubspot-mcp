@@ -688,19 +688,73 @@ function createServer({ config }: { config?: any } = {}) {
   )
 
   server.tool("crm_get_contact",
-    "Get a single contact by ID with specific properties and associations",
+    "Get a single contact by ID or email with specific properties and associations",
     {
-      contactId: z.string(),
+      contactId: z.string().describe("HubSpot Contact ID or email address"),
       properties: z.array(z.string()).optional(),
       associations: z.array(z.enum(['companies', 'deals', 'tickets', 'calls', 'emails', 'meetings', 'notes'])).optional()
     },
     async (params) => {
       return handleEndpoint(async () => {
-        const endpoint = `/crm/v3/objects/contacts/${params.contactId}`
-        return await makeApiRequestWithErrorHandling(hubspotAccessToken, endpoint, {
+        const isEmail = params.contactId.includes('@')
+        const endpoint = `/crm/v3/objects/contacts/${encodeURIComponent(params.contactId)}`
+        const queryParams: Record<string, any> = {
           properties: params.properties?.join(','),
           associations: params.associations?.join(',')
-        })
+        }
+        if (isEmail) {
+          queryParams.idProperty = 'email'
+        }
+        return await makeApiRequestWithErrorHandling(hubspotAccessToken, endpoint, queryParams)
+      })
+    }
+  )
+
+  server.tool("contact_get_web_analytics",
+    "Get contact web analytics, website page views, visits, browsing history, traffic sources, and referrers. Use this tool when asked which web pages a contact or customer visited on the website, how many times they visited, their landing page, or their traffic source.",
+    {
+      contactId: z.string().describe("HubSpot Contact ID or email address"),
+      additionalProperties: z.array(z.string()).optional().describe("Optional extra contact properties to retrieve")
+    },
+    async (params) => {
+      return handleEndpoint(async () => {
+        const isEmail = params.contactId.includes('@')
+        const endpoint = `/crm/v3/objects/contacts/${encodeURIComponent(params.contactId)}`
+        const defaultAnalyticsProps = [
+          'email',
+          'firstname',
+          'lastname',
+          'hs_analytics_first_url',
+          'hs_analytics_last_url',
+          'hs_analytics_num_page_views',
+          'hs_analytics_num_visits',
+          'hs_analytics_first_referrer',
+          'hs_analytics_last_referrer',
+          'hs_analytics_first_visit_timestamp',
+          'hs_analytics_last_visit_timestamp',
+          'hs_analytics_source',
+          'hs_analytics_source_data_1',
+          'hs_analytics_source_data_2',
+          'hs_latest_source',
+          'hs_latest_source_data_1',
+          'hs_latest_source_data_2',
+          'hs_latest_source_timestamp',
+          'hs_analytics_average_page_views',
+          'hs_analytics_first_touch_converting_campaign',
+          'hs_analytics_last_touch_converting_campaign',
+          'ip_city',
+          'ip_country',
+          'ip_state',
+          'hs_ip_timezone'
+        ]
+        const allProps = Array.from(new Set([...defaultAnalyticsProps, ...(params.additionalProperties || [])]))
+        const queryParams: Record<string, any> = {
+          properties: allProps.join(',')
+        }
+        if (isEmail) {
+          queryParams.idProperty = 'email'
+        }
+        return await makeApiRequestWithErrorHandling(hubspotAccessToken, endpoint, queryParams)
       })
     }
   )
