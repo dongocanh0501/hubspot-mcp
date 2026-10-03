@@ -76,13 +76,19 @@ export function isCustomerMessage(msg) {
  * Common short acknowledgment or closing phrases in Vietnamese.
  */
 const CLOSING_PHRASES = [
-  'oki', 'ok', 'oke', 'ok nè', 'oki b an', 'oki bạn nè', 'oki b', 'ok b',
-  'ạ', 'da', 'dạ', 'dạ vâng', 'vang', 'vâng', 'cảm ơn', 'cam on',
-  'thanks', 'thank you', 'tks', 'thank', 'da cam on', 'dạ cảm ơn'
+  'oki', 'ok', 'oke', 'okie', 'ok nè', 'oki b an', 'oki bạn nè', 'oki bạn', 'oki b', 'ok b', 'ok bạn', 'ok shop', 'ok nhé', 'ok nha',
+  'ạ', 'da', 'dạ', 'dạ vâng', 'vang', 'vâng', 'cảm ơn', 'cam on', 'cảm ơn bạn', 'cảm ơn shop',
+  'thanks', 'thank you', 'tks', 'thank', 'da cam on', 'dạ cảm ơn',
+  'đây nha', 'đây nha bạn', 'đây bạn', 'đây nè', 'đây nè bạn', 'đây nhé', 'đây ạ', 'đây shop', 'đây',
+  'nè bạn', 'nè shop', 'nè ad', 'nè bồ', 'nè ní', 'nè',
+  'xem giúp', 'xem giùm', 'xem hộ', 'xem giúp mình', 'xem giùm mình', 'xem hộ mình', 'check giúp', 'check giùm',
+  'gửi bạn', 'gửi nè', 'gửi shop', 'đã gửi', 'mình gửi', 'em gửi', 'rồi nha', 'xong rồi', 'xong rùi'
 ];
 
+const BURST_FOLLOWUP_REGEX = /^(đây\s*(nha|nhé|nè|ạ|ah|nhe|bạn|shop|bồ|ní)?|nè\s*(bạn|shop|ad|bồ|ní)?|xem\s*(giúp|giùm|hộ)(\s*mình|\s*em|\s*bạn)?|check\s*(giúp|giùm|hộ)|(mình|em|tui)?\s*gửi\s*(nè|ạ|nha|bạn|shop)?|(đã|mới)\s*gửi|(ok|oki|oke|okie)(\s*(nha|nhé|nè|ạ|ah|nhe|bạn|shop|ad|bồ|ní|b|roi|rồi))?|dạ|ạ|vâng|rồi\s*(nha|nhé|ạ|rùi)|xong\s*(rồi|rùi))$/i;
+
 /**
- * Checks if a message text is simply a short acknowledgement or courtesy sign-off.
+ * Checks if a message text is simply a short acknowledgement or courtesy sign-off or burst follow-up.
  *
  * @param {string} text
  * @returns {boolean}
@@ -90,19 +96,40 @@ const CLOSING_PHRASES = [
 export function isAcknowledgementMessage(text) {
   if (!text || typeof text !== 'string') return false;
   const cleaned = text.trim().toLowerCase().replace(/[.!?,;:~-]+$/g, '').trim();
-  return CLOSING_PHRASES.includes(cleaned);
+  return CLOSING_PHRASES.includes(cleaned) || BURST_FOLLOWUP_REGEX.test(cleaned);
+}
+
+/**
+ * Extracts plain text from various HubSpot message structures (text, body, richText).
+ *
+ * @param {object} msg
+ * @returns {string} Plain text
+ */
+export function getMessageText(msg) {
+  if (!msg || typeof msg !== 'object') return '';
+  if (typeof msg.text === 'string' && msg.text.trim()) return msg.text.trim();
+  if (typeof msg.body === 'string' && msg.body.trim()) return msg.body.trim();
+  if (typeof msg.richText === 'string' && msg.richText.trim()) {
+    return msg.richText.replace(/<[^>]*>/g, '').trim();
+  }
+  return '';
 }
 
 /**
  * Computes deduplication and response context for a conversation thread.
  *
  * @param {Array<object>|object} input - Messages array or response object { results: [...] }
- * @param {object} [options]
- * @param {string} [options.targetMessageId] - ID of the specific message dequeued for execution
- * @param {boolean} [options.enableAckDetection=false] - Check for closing/ack phrases
+ * @param {object|string} [optionsOrCurrentText]
+ * @param {string} [optionsOrCurrentText.targetMessageId] - ID of the specific message dequeued for execution
+ * @param {string} [optionsOrCurrentText.currentMessageText] - Current incoming or candidate text
+ * @param {boolean} [optionsOrCurrentText.enableAckDetection=false] - Check for closing/ack phrases
  * @returns {object} AntiDuplicationContext
  */
-export function computeAntiDuplicationContext(input, options = {}) {
+export function computeAntiDuplicationContext(input, optionsOrCurrentText = {}) {
+  const options = typeof optionsOrCurrentText === 'string'
+    ? { currentMessageText: optionsOrCurrentText }
+    : (optionsOrCurrentText || {});
+
   const rawList = Array.isArray(input) ? input : (input?.results || input?.messages || []);
   const sortedAsc = sortMessages(rawList, 'ASCENDING');
 
@@ -120,10 +147,15 @@ export function computeAntiDuplicationContext(input, options = {}) {
   const lastAgentReply = agentMessages.length > 0 ? agentMessages[agentMessages.length - 1] : null;
   const lastCustomerMessage = customerMessages.length > 0 ? customerMessages[customerMessages.length - 1] : null;
   const lastAgentTime = lastAgentReply ? getMessageTimestamp(lastAgentReply) : 0;
+  const lastAgentText = lastAgentReply ? getMessageText(lastAgentReply) : '';
 
-  // Unreplied customer messages: sent strictly AFTER the latest agent message
+  // SIMULTANEOUS_TOLERANCE_MS: In real-time chat, messages sent within a few seconds of agent response
+  // or before it are considered already addressed or near-simultaneous
+  const SIMULTANEOUS_TOLERANCE_MS = 5000;
+
+  // Unreplied customer messages: sent strictly AFTER the latest agent message (+ tolerance)
   const unrepliedCustomerMessages = customerMessages.filter(msg => {
-    return getMessageTimestamp(msg) > lastAgentTime;
+    return getMessageTimestamp(msg) > (lastAgentTime + SIMULTANEOUS_TOLERANCE_MS);
   });
 
   const newCustomerMessagesSinceLastReply = unrepliedCustomerMessages.length;
@@ -137,7 +169,17 @@ export function computeAntiDuplicationContext(input, options = {}) {
     if (targetMessage) {
       const targetTime = getMessageTimestamp(targetMessage);
       // If target message was sent before or during the last agent response, it was already addressed
-      targetMessageAddressed = lastAgentReply ? targetTime <= lastAgentTime : false;
+      targetMessageAddressed = lastAgentReply ? (targetTime <= lastAgentTime + SIMULTANEOUS_TOLERANCE_MS) : false;
+    }
+  }
+
+  // Check echo / repetition of currentMessageText
+  let isCurrentMessageEcho = false;
+  if (options.currentMessageText && lastAgentText) {
+    const curNorm = options.currentMessageText.trim().toLowerCase();
+    const agNorm = lastAgentText.trim().toLowerCase();
+    if (curNorm.length > 0 && (curNorm === agNorm || agNorm.includes(curNorm) || curNorm.includes(agNorm))) {
+      isCurrentMessageEcho = true;
     }
   }
 
@@ -146,7 +188,12 @@ export function computeAntiDuplicationContext(input, options = {}) {
   let recommendedAction;
   let reason;
 
-  if (targetMessage) {
+  if (isCurrentMessageEcho) {
+    allRecentCustomerMessagesAddressed = true;
+    needsReply = false;
+    recommendedAction = 'NO_REPLY';
+    reason = 'Nội dung tin nhắn trùng khớp với phản hồi gần nhất của Agent (outgoing echo/phản hồi lặp lại).';
+  } else if (targetMessage) {
     if (targetMessageAddressed) {
       allRecentCustomerMessagesAddressed = true;
       needsReply = false;
@@ -173,7 +220,13 @@ export function computeAntiDuplicationContext(input, options = {}) {
       allRecentCustomerMessagesAddressed = true;
       needsReply = false;
       recommendedAction = 'NO_REPLY';
-      reason = `All recent customer messages were sent prior to agent reply '${lastAgentReply.id}' sent at ${new Date(lastAgentTime).toISOString()}. No new messages from customer since.`;
+      const isNearSimultaneous = customerMessages.some(m => {
+        const t = getMessageTimestamp(m);
+        return t > lastAgentTime && t <= (lastAgentTime + SIMULTANEOUS_TOLERANCE_MS);
+      });
+      reason = isNearSimultaneous
+        ? `Tất cả tin nhắn khách hàng gần đây đều có timestamp trước hoặc gần như đồng thời (trong vòng 5s) so với thời điểm Agent phản hồi '${lastAgentReply.id}' lúc ${new Date(lastAgentTime).toISOString()}, và Agent đã có nội dung trả lời.`
+        : `All recent customer messages were sent prior to agent reply '${lastAgentReply.id}' sent at ${new Date(lastAgentTime).toISOString()}. No new messages from customer since.`;
     } else {
       allRecentCustomerMessagesAddressed = false;
       needsReply = true;
@@ -182,18 +235,53 @@ export function computeAntiDuplicationContext(input, options = {}) {
     }
   }
 
-  // Optional: Check if the only pending message is a brief courtesy acknowledgement
+  // Check if the only pending message or current message text is a brief courtesy acknowledgement / burst follow-up
   let isClosingRemark = false;
-  if (options.enableAckDetection && needsReply && unrepliedCustomerMessages.length === 1) {
-    const pendingText = unrepliedCustomerMessages[0].text || unrepliedCustomerMessages[0].body || '';
-    if (isAcknowledgementMessage(pendingText)) {
+  if (options.enableAckDetection && lastAgentReply) {
+    if (options.currentMessageText && isAcknowledgementMessage(options.currentMessageText)) {
       isClosingRemark = true;
       allRecentCustomerMessagesAddressed = true;
       needsReply = false;
       recommendedAction = 'NO_REPLY';
-      reason = `Customer message '${unrepliedCustomerMessages[0].id}' is a courtesy closing remark ("${pendingText}"). No further reply needed.`;
+      reason = `Incoming/candidate message ("${options.currentMessageText}") is a courtesy acknowledgment or burst follow-up for prior agent reply sent at ${new Date(lastAgentTime).toISOString()}. No further reply needed.`;
+    } else if (needsReply && unrepliedCustomerMessages.length === 1) {
+      const pendingText = getMessageText(unrepliedCustomerMessages[0]);
+      if (isAcknowledgementMessage(pendingText)) {
+        isClosingRemark = true;
+        allRecentCustomerMessagesAddressed = true;
+        needsReply = false;
+        recommendedAction = 'NO_REPLY';
+        reason = `Customer message '${unrepliedCustomerMessages[0].id}' is a courtesy closing remark or burst follow-up ("${pendingText}"). No further reply needed.`;
+      }
     }
   }
+
+  const lastAgentSummary = lastAgentReply ? {
+    id: lastAgentReply.id,
+    text: lastAgentText,
+    createdAt: lastAgentReply.createdAt || lastAgentReply.timestamp,
+    createdBy: lastAgentReply.createdBy,
+    direction: lastAgentReply.direction,
+    timestamp: lastAgentTime
+  } : null;
+
+  const lastCustomerSummary = lastCustomerMessage ? {
+    id: lastCustomerMessage.id,
+    text: getMessageText(lastCustomerMessage),
+    createdAt: lastCustomerMessage.createdAt || lastCustomerMessage.timestamp,
+    createdBy: lastCustomerMessage.createdBy,
+    direction: lastCustomerMessage.direction,
+    timestamp: getMessageTimestamp(lastCustomerMessage)
+  } : null;
+
+  const unrepliedFormatted = unrepliedCustomerMessages.map(m => ({
+    id: m.id,
+    text: getMessageText(m),
+    createdAt: m.createdAt || m.timestamp,
+    createdBy: m.createdBy,
+    direction: m.direction,
+    timestamp: getMessageTimestamp(m)
+  }));
 
   return {
     allRecentCustomerMessagesAddressed,
@@ -201,26 +289,12 @@ export function computeAntiDuplicationContext(input, options = {}) {
     recommendedAction,
     reason,
     isClosingRemark,
+    isCurrentMessageEcho,
     totalMessages: sortedAsc.length,
     newCustomerMessagesSinceLastReply,
-    lastAgentReply: lastAgentReply ? {
-      id: lastAgentReply.id,
-      text: lastAgentReply.text || lastAgentReply.body || '',
-      createdAt: lastAgentReply.createdAt || lastAgentReply.timestamp,
-      timestamp: lastAgentTime
-    } : null,
-    lastCustomerMessage: lastCustomerMessage ? {
-      id: lastCustomerMessage.id,
-      text: lastCustomerMessage.text || lastCustomerMessage.body || '',
-      createdAt: lastCustomerMessage.createdAt || lastCustomerMessage.timestamp,
-      timestamp: getMessageTimestamp(lastCustomerMessage)
-    } : null,
-    unrepliedCustomerMessages: unrepliedCustomerMessages.map(m => ({
-      id: m.id,
-      text: m.text || m.body || '',
-      createdAt: m.createdAt || m.timestamp,
-      timestamp: getMessageTimestamp(m)
-    })),
+    lastAgentReply: lastAgentSummary,
+    lastCustomerMessage: lastCustomerSummary,
+    unrepliedCustomerMessages: unrepliedFormatted,
     alreadyAddressedGuidance: recommendedAction === 'NO_REPLY'
       ? `[ANTI-DUPLICATION NOTICE] This message or topic has already been addressed by agent reply at ${lastAgentReply ? new Date(lastAgentTime).toISOString() : 'N/A'}. Do NOT send a duplicate message. Return NO_REPLY.`
       : null
@@ -453,8 +527,92 @@ runTest('Test Case 4D: Response wrapper object { results: [...] } support', () =
 });
 
 // ----------------------------------------------------------------------------
+// TEST CASE 5: Real-World Incident (nhintt018@gmail.com - Thread 11250236293)
+// Burst Image + Short Follow-up ("đây nha bạn")
+// ----------------------------------------------------------------------------
+console.log('\n--- 📌 TEST CASE 5: Real-world Incident (nhintt018@gmail.com - Burst & Zero-Tool Guard) ---');
+
+const burstMsg1 = {
+  id: 'burst-msg-1',
+  direction: 'INCOMING',
+  senders: [{ actorId: 'V-252259644968' }],
+  createdAt: '2026-10-03T13:25:36.035Z',
+  text: 'https://hubspot-attachments.s3.amazonaws.com/qr-bank.jpg'
+};
+
+const burstMsg2 = {
+  id: 'burst-msg-2',
+  direction: 'INCOMING',
+  senders: [{ actorId: 'V-252259644968' }],
+  createdAt: '2026-10-03T13:25:36.680Z',
+  text: 'đây nha bạn'
+};
+
+const burstMsg3 = {
+  id: 'burst-msg-3',
+  direction: 'OUTGOING',
+  senders: [{ actorId: 'A-61685315' }],
+  createdAt: '2026-10-03T13:26:48.615Z',
+  text: 'Dạ tui thấy ảnh mã QR ngân hàng MB của bồ rồi hen, để tui tiến hành hỗ trợ xác thực tài khoản nhé!'
+};
+
+runTest('Test Case 5A: Queue worker dequeues burstMsg2 ("đây nha bạn") after Agent already replied to burstMsg1', () => {
+  const threadHistory = [burstMsg1, burstMsg2, burstMsg3];
+
+  const context = computeAntiDuplicationContext(threadHistory, { targetMessageId: 'burst-msg-2' });
+
+  assert.equal(context.allRecentCustomerMessagesAddressed, true, 'burstMsg2 was created prior to agent reply burstMsg3');
+  assert.equal(context.recommendedAction, 'NO_REPLY', "recommendedAction should be 'NO_REPLY'");
+  assert.equal(context.needsReply, false, 'needsReply should be false');
+  assert.ok(context.alreadyAddressedGuidance, 'alreadyAddressedGuidance must be provided');
+  assert.ok(context.alreadyAddressedGuidance.includes('NO_REPLY'));
+});
+
+runTest('Test Case 5B: Direct incoming check on candidate text ("đây nha bạn") with enableAckDetection', () => {
+  const threadHistory = [burstMsg1, burstMsg2, burstMsg3];
+
+  const context = computeAntiDuplicationContext(threadHistory, {
+    currentMessageText: 'đây nha bạn',
+    enableAckDetection: true
+  });
+
+  assert.equal(context.isClosingRemark, true, 'Should detect burst follow-up regex');
+  assert.equal(context.recommendedAction, 'NO_REPLY');
+  assert.equal(context.needsReply, false);
+  assert.equal(context.allRecentCustomerMessagesAddressed, true);
+});
+
+runTest('Test Case 5C: Outgoing echo detection (candidate text matches prior agent response)', () => {
+  const threadHistory = [burstMsg1, burstMsg2, burstMsg3];
+
+  const context = computeAntiDuplicationContext(threadHistory, {
+    currentMessageText: 'Dạ tui thấy ảnh mã QR ngân hàng MB của bồ rồi hen'
+  });
+
+  assert.equal(context.isCurrentMessageEcho, true, 'Should detect identical/contained agent echo');
+  assert.equal(context.recommendedAction, 'NO_REPLY');
+  assert.equal(context.needsReply, false);
+});
+
+runTest('Test Case 5D: Variety of Vietnamese burst continuation phrases recognized', () => {
+  const testPhrases = [
+    'đây nha', 'đây nha bạn', 'đây nè bạn', 'nè bạn', 'xem giúp mình',
+    'check giúp', 'mình gửi nha', 'đã gửi', 'xong rồi', 'dạ', 'oki bạn'
+  ];
+
+  for (const phrase of testPhrases) {
+    assert.equal(
+      isAcknowledgementMessage(phrase),
+      true,
+      `Phrase "${phrase}" must be recognized as acknowledgment or burst follow-up`
+    );
+  }
+});
+
+// ----------------------------------------------------------------------------
 // Summary
 // ----------------------------------------------------------------------------
 console.log('\n' + '='.repeat(75));
 console.log(`🏁 VERIFICATION COMPLETE: ${passCount}/${totalTests} Tests Passed (100% SUCCESS)`);
 console.log('='.repeat(75) + '\n');
+

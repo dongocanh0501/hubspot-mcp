@@ -2748,15 +2748,21 @@ function createServer({ config }: { config?: any } = {}) {
   }
 
   const CLOSING_PHRASES = [
-    'oki', 'ok', 'oke', 'ok nè', 'oki b an', 'oki bạn nè', 'oki b', 'ok b',
-    'ạ', 'da', 'dạ', 'dạ vâng', 'vang', 'vâng', 'cảm ơn', 'cam on',
-    'thanks', 'thank you', 'tks', 'thank', 'da cam on', 'dạ cảm ơn'
+    'oki', 'ok', 'oke', 'okie', 'ok nè', 'oki b an', 'oki bạn nè', 'oki bạn', 'oki b', 'ok b', 'ok bạn', 'ok shop', 'ok nhé', 'ok nha',
+    'ạ', 'da', 'dạ', 'dạ vâng', 'vang', 'vâng', 'cảm ơn', 'cam on', 'cảm ơn bạn', 'cảm ơn shop',
+    'thanks', 'thank you', 'tks', 'thank', 'da cam on', 'dạ cảm ơn',
+    'đây nha', 'đây nha bạn', 'đây bạn', 'đây nè', 'đây nè bạn', 'đây nhé', 'đây ạ', 'đây shop', 'đây',
+    'nè bạn', 'nè shop', 'nè ad', 'nè bồ', 'nè ní', 'nè',
+    'xem giúp', 'xem giùm', 'xem hộ', 'xem giúp mình', 'xem giùm mình', 'xem hộ mình', 'check giúp', 'check giùm',
+    'gửi bạn', 'gửi nè', 'gửi shop', 'đã gửi', 'mình gửi', 'em gửi', 'rồi nha', 'xong rồi', 'xong rùi'
   ]
+
+  const BURST_FOLLOWUP_REGEX = /^(đây\s*(nha|nhé|nè|ạ|ah|nhe|bạn|shop|bồ|ní)?|nè\s*(bạn|shop|ad|bồ|ní)?|xem\s*(giúp|giùm|hộ)(\s*mình|\s*em|\s*bạn)?|check\s*(giúp|giùm|hộ)|(mình|em|tui)?\s*gửi\s*(nè|ạ|nha|bạn|shop)?|(đã|mới)\s*gửi|(ok|oki|oke|okie)(\s*(nha|nhé|nè|ạ|ah|nhe|bạn|shop|ad|bồ|ní|b|roi|rồi))?|dạ|ạ|vâng|rồi\s*(nha|nhé|ạ|rùi)|xong\s*(rồi|rùi))$/i
 
   function isAcknowledgementMessage(text: string): boolean {
     if (!text || typeof text !== 'string') return false
     const cleaned = text.trim().toLowerCase().replace(/[.!?,;:~-]+$/g, '').trim()
-    return CLOSING_PHRASES.includes(cleaned)
+    return CLOSING_PHRASES.includes(cleaned) || BURST_FOLLOWUP_REGEX.test(cleaned)
   }
 
   function getMessageText(msg: any): string {
@@ -2885,16 +2891,24 @@ function createServer({ config }: { config?: any } = {}) {
       }
     }
 
-    // Check if the only pending message is a brief courtesy acknowledgement
+    // Check if the only pending message or current message text is a brief courtesy acknowledgement / burst follow-up
     let isClosingRemark = false
-    if (options.enableAckDetection && needsReply && unrepliedCustomerMessages.length === 1) {
-      const pendingText = getMessageText(unrepliedCustomerMessages[0])
-      if (isAcknowledgementMessage(pendingText)) {
+    if (options.enableAckDetection && lastAgentReply) {
+      if (options.currentMessageText && isAcknowledgementMessage(options.currentMessageText)) {
         isClosingRemark = true
         allRecentCustomerMessagesAddressed = true
         needsReply = false
         recommendedAction = 'NO_REPLY'
-        reason = `Customer message '${unrepliedCustomerMessages[0].id}' is a courtesy closing remark ("${pendingText}"). No further reply needed.`
+        reason = `Incoming/candidate message ("${options.currentMessageText}") is a courtesy acknowledgment or burst follow-up for prior agent reply sent at ${new Date(lastAgentTime).toISOString()}. No further reply needed.`
+      } else if (needsReply && unrepliedCustomerMessages.length === 1) {
+        const pendingText = getMessageText(unrepliedCustomerMessages[0])
+        if (isAcknowledgementMessage(pendingText)) {
+          isClosingRemark = true
+          allRecentCustomerMessagesAddressed = true
+          needsReply = false
+          recommendedAction = 'NO_REPLY'
+          reason = `Customer message '${unrepliedCustomerMessages[0].id}' is a courtesy closing remark or burst follow-up ("${pendingText}"). No further reply needed.`
+        }
       }
     }
 
@@ -3140,10 +3154,10 @@ function createServer({ config }: { config?: any } = {}) {
 
   server.tool(
     "conversations_check_reply_needed",
-    "Evaluate whether a conversation thread currently requires a reply from Agent/Bot or should return NO_REPLY to prevent duplicate messaging. Analyzes recent incoming vs outgoing messages, compares timestamps, inspects the last agent message, and identifies unreplied customer inquiries.",
+    "MANDATORY ANTI-DUPLICATION CHECK: Evaluate whether a conversation thread currently requires a reply from Agent/Bot or should return NO_REPLY. You MUST call this tool whenever a customer sends a short message (< 5 words), burst follow-up ('đây nha', 'nè bạn', 'xem giúp', 'ạ', 'dạ'), or when you are uncertain if the inquiry has already been answered. Analyzes recent incoming vs outgoing messages, compares timestamps, inspects the last agent message, and identifies unreplied customer inquiries.",
     {
       threadId: z.string().describe("The HubSpot conversation thread ID (or Contact ID / Email for auto-resolution)"),
-      currentMessageText: z.string().optional().describe("Optional text of the incoming message or candidate reply to check against the last sent agent message to avoid echoes or repetition")
+      currentMessageText: z.string().optional().describe("The incoming message text or candidate reply to check against the last sent agent message to avoid echoes or burst duplicates")
     },
     async (params) => handleEndpoint(async () => {
       let actualThreadId = params.threadId
