@@ -711,7 +711,7 @@ function createServer({ config }: { config?: any } = {}) {
   )
 
   server.tool("contact_get_web_analytics",
-    "Get contact web analytics, website page views, visits, browsing history, traffic sources, and referrers. Use this tool when asked which web pages a contact or customer visited on the website, how many times they visited, their landing page, or their traffic source.",
+    "Get contact web analytics, website page views, visits, browsing history, traffic sources, and referrers. Use this tool ONLY when asked which web pages a contact visited on the website, how many times they visited, their landing page, or traffic source. CRITICAL NEGATIVE CONSTRAINT: Do NOT use this tool for reading customer chat, Facebook Messenger, live chat, or conversation messages. For conversation messages or customer chat history, use conversations_get_contact_messages or conversations_list_threads.",
     {
       contactId: z.string().describe("HubSpot Contact ID or email address"),
       additionalProperties: z.array(z.string()).optional().describe("Optional extra contact properties to retrieve")
@@ -754,7 +754,14 @@ function createServer({ config }: { config?: any } = {}) {
         if (isEmail) {
           queryParams.idProperty = 'email'
         }
-        return await makeApiRequestWithErrorHandling(hubspotAccessToken, endpoint, queryParams)
+        const data = await makeApiRequestWithErrorHandling(hubspotAccessToken, endpoint, queryParams)
+        if (data && typeof data === 'object' && !Array.isArray(data)) {
+          return {
+            _guidance: "Note: This tool only returns website browsing history and traffic sources. It does NOT contain chat/Messenger/conversation messages. To read conversations or chat messages for this contact, call conversations_get_contact_messages.",
+            ...data
+          }
+        }
+        return data
       })
     }
   )
@@ -2780,7 +2787,7 @@ function createServer({ config }: { config?: any } = {}) {
 
   server.tool(
     "conversations_get_contact_messages",
-    "Retrieve conversation messages directly for a customer by contact ID or email across all channels (Facebook Messenger, Live Chat) in HubSpot. Automatically aggregates all threads across all merged contact profiles (hs_all_contact_vids) and returns messages from the most recent active conversation in a single call. Use this whenever you want to read or inspect a customer's chat messages without manually listing threads first.",
+    "Retrieve conversation messages directly for a customer by contact ID or email across all channels (Facebook Messenger, Live Chat) in HubSpot. Đọc các đoạn hội thoại, tin nhắn chat của khách hàng. Automatically aggregates all threads across all merged contact profiles (hs_all_contact_vids) and returns messages from the most recent active conversation in a single call. Use this whenever asked to read conversation history, chat messages, or 'đọc các đoạn hội thoại của khách hàng' without needing a thread ID.",
     {
       contactIdOrEmail: z.string().describe("Customer HubSpot contact ID (e.g. '252745349968') or email (e.g. 'thecuongnguyen789@gmail.com')"),
       limit: z.number().optional().describe("Maximum number of messages to return (max 100, default 20)"),
