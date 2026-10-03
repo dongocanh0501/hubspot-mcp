@@ -73,6 +73,25 @@ export function isCustomerMessage(msg) {
 }
 
 /**
+ * Determines whether a message originates from an agent or bot.
+ *
+ * @param {object} msg
+ * @returns {boolean} True if agent/bot/outgoing
+ */
+export function isAgentMessage(msg) {
+  if (!msg) return false;
+  if (typeof msg.direction === 'string') {
+    return msg.direction.toUpperCase() === 'OUTGOING';
+  }
+  const actorId = msg.senders?.[0]?.actorId || msg.createdBy || msg.actorId || '';
+  if (typeof actorId === 'string') {
+    if (actorId.startsWith('A-') || actorId.startsWith('B-') || actorId.startsWith('S-') || actorId.toUpperCase().includes('AGENT') || actorId.toUpperCase().includes('BOT') || actorId.toUpperCase().includes('USER')) return true;
+    if (actorId.startsWith('V-') || actorId.toUpperCase().includes('VISITOR')) return false;
+  }
+  return false;
+}
+
+/**
  * Common short acknowledgment or closing phrases in Vietnamese.
  */
 const CLOSING_PHRASES = [
@@ -139,7 +158,7 @@ export function computeAntiDuplicationContext(input, optionsOrCurrentText = {}) 
   for (const msg of sortedAsc) {
     if (isCustomerMessage(msg)) {
       customerMessages.push(msg);
-    } else {
+    } else if (isAgentMessage(msg)) {
       agentMessages.push(msg);
     }
   }

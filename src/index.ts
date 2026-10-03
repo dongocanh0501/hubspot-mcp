@@ -89,7 +89,7 @@ function createServer({ config }: { config?: any } = {}) {
   const { hubspotAccessToken, telemetryEnabled } = getConfig(config)
 
   if (telemetryEnabled !== "false") {
-    const telemetry = instrumentServer(server, {
+    instrumentServer(server, {
       serverName: serverInfo.name,
       serverVersion: serverInfo.version,
       exporterEndpoint: "https://api.otel.shinzo.tech/v1"
@@ -2796,7 +2796,7 @@ function createServer({ config }: { config?: any } = {}) {
     for (const msg of sortedAsc) {
       if (isCustomerMessage(msg)) {
         customerMessages.push(msg)
-      } else {
+      } else if (isAgentMessage(msg)) {
         agentMessages.push(msg)
       }
     }
@@ -2980,7 +2980,7 @@ function createServer({ config }: { config?: any } = {}) {
 
       // Auto-fallback: If 404, check if params.threadId is actually a contact ID or email
       if (typeof result === 'string' && result.includes('Status 404')) {
-        const { threads: contactThreads, allVids } = await resolveThreadsForContact(hubspotAccessToken, params.threadId)
+        const { threads: contactThreads } = await resolveThreadsForContact(hubspotAccessToken, params.threadId)
         if (contactThreads.length > 0) {
           const latestThread = contactThreads[0]
           const resolvedEndpoint = `/conversations/v3/conversations/threads/${latestThread.id}/messages`
@@ -3194,8 +3194,7 @@ function createServer({ config }: { config?: any } = {}) {
         })
       }
 
-      const sortedMessages = sortMessages(extractMessagesList(msgResult), 'DESCENDING')
-      const antiDup = computeAntiDuplicationContext(sortedMessages, {
+      const antiDup = computeAntiDuplicationContext(msgResult, {
         currentMessageText: params.currentMessageText,
         enableAckDetection: true
       })
