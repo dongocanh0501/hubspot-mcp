@@ -2669,19 +2669,299 @@ function createServer({ config }: { config?: any } = {}) {
     return { threads: threads.slice(0, limit), allVids: Array.from(allVids) }
   }
 
+  // --- HubSpot Conversations Helpers & Anti-Duplication Engine ---
+
+  function getMessageTimestamp(msg: any): number {
+    if (!msg) return 0
+    const raw = msg.createdAt ?? msg.timestamp ?? msg.createdDate ?? 0
+    if (typeof raw === 'number') return raw
+    const num = Number(raw)
+    if (!isNaN(num) && num > 1000000000) return num
+    const parsed = new Date(raw).getTime()
+    return isNaN(parsed) ? 0 : parsed
+  }
+
+  function extractMessagesList(raw: any): any[] {
+    if (!raw) return []
+    if (Array.isArray(raw)) return raw
+    if (typeof raw === 'object') {
+      if (Array.isArray(raw.results)) return raw.results
+      if (Array.isArray(raw.messages)) return raw.messages
+    }
+    return []
+  }
+
+  function sortMessages(messages: any[], direction: 'ASCENDING' | 'DESCENDING' = 'ASCENDING'): any[] {
+    if (!Array.isArray(messages)) return []
+    const isDesc = String(direction).toUpperCase() === 'DESCENDING'
+    return [...messages].sort((a, b) => {
+      const tA = getMessageTimestamp(a)
+      const tB = getMessageTimestamp(b)
+      return isDesc ? tB - tA : tA - tB
+    })
+  }
+
+  function applySortToMessagesResult(result: any, sort: 'ASCENDING' | 'DESCENDING' = 'DESCENDING'): any {
+    if (!result || typeof result !== 'object') return result
+    if (Array.isArray(result)) {
+      return sortMessages(result, sort)
+    }
+    if (Array.isArray(result.results)) {
+      return {
+        ...result,
+        results: sortMessages(result.results, sort)
+      }
+    }
+    if (Array.isArray(result.messages)) {
+      return {
+        ...result,
+        messages: sortMessages(result.messages, sort)
+      }
+    }
+    return result
+  }
+
+  function isCustomerMessage(msg: any): boolean {
+    if (!msg) return false
+    if (typeof msg.direction === 'string') {
+      return msg.direction.toUpperCase() === 'INCOMING'
+    }
+    const actorId = msg.senders?.[0]?.actorId || msg.createdBy || msg.actorId || ''
+    if (typeof actorId === 'string') {
+      if (actorId.startsWith('V-') || actorId.toUpperCase().includes('VISITOR')) return true
+      if (actorId.startsWith('A-') || actorId.toUpperCase().includes('AGENT')) return false
+    }
+    return false
+  }
+
+  function isAgentMessage(msg: any): boolean {
+    if (!msg) return false
+    if (typeof msg.direction === 'string') {
+      return msg.direction.toUpperCase() === 'OUTGOING'
+    }
+    const actorId = msg.senders?.[0]?.actorId || msg.createdBy || msg.actorId || ''
+    if (typeof actorId === 'string') {
+      if (actorId.startsWith('A-') || actorId.startsWith('B-') || actorId.toUpperCase().includes('AGENT') || actorId.toUpperCase().includes('BOT') || actorId.toUpperCase().includes('USER')) return true
+      if (actorId.startsWith('V-') || actorId.toUpperCase().includes('VISITOR')) return false
+    }
+    return false
+  }
+
+  const CLOSING_PHRASES = [
+    'oki', 'ok', 'oke', 'ok nè', 'oki b an', 'oki bạn nè', 'oki b', 'ok b',
+    'ạ', 'da', 'dạ', 'dạ vâng', 'vang', 'vâng', 'cảm ơn', 'cam on',
+    'thanks', 'thank you', 'tks', 'thank', 'da cam on', 'dạ cảm ơn'
+  ]
+
+  function isAcknowledgementMessage(text: string): boolean {
+    if (!text || typeof text !== 'string') return false
+    const cleaned = text.trim().toLowerCase().replace(/[.!?,;:~-]+$/g, '').trim()
+    return CLOSING_PHRASES.includes(cleaned)
+  }
+
+  function getMessageText(msg: any): string {
+    if (!msg || typeof msg !== 'object') return ''
+    if (typeof msg.text === 'string' && msg.text.trim()) return msg.text.trim()
+    if (typeof msg.body === 'string' && msg.body.trim()) return msg.body.trim()
+    if (typeof msg.richText === 'string' && msg.richText.trim()) {
+      return msg.richText.replace(/<[^>]*>/g, '').trim()
+    }
+    return ''
+  }
+
+  function computeAntiDuplicationContext(
+    input: any,
+    optionsOrCurrentText: {
+      targetMessageId?: string
+      currentMessageText?: string
+      enableAckDetection?: boolean
+    } | string = {}
+  ) {
+    const options = typeof optionsOrCurrentText === 'string'
+      ? { currentMessageText: optionsOrCurrentText }
+      : (optionsOrCurrentText || {})
+
+    const rawList = extractMessagesList(input)
+    const sortedAsc = sortMessages(rawList, 'ASCENDING')
+
+    const customerMessages: any[] = []
+    const agentMessages: any[] = []
+
+    for (const msg of sortedAsc) {
+      if (isCustomerMessage(msg)) {
+        customerMessages.push(msg)
+      } else {
+        agentMessages.push(msg)
+      }
+    }
+
+    const lastAgentReply = agentMessages.length > 0 ? agentMessages[agentMessages.length - 1] : null
+    const lastCustomerMessage = customerMessages.length > 0 ? customerMessages[customerMessages.length - 1] : null
+    const lastAgentTime = lastAgentReply ? getMessageTimestamp(lastAgentReply) : 0
+    const lastAgentText = lastAgentReply ? getMessageText(lastAgentReply) : ''
+
+    // SIMULTANEOUS_TOLERANCE_MS: In real-time chat, messages sent within a few seconds of agent response
+    // or before it are considered already addressed or near-simultaneous
+    const SIMULTANEOUS_TOLERANCE_MS = 5000
+
+    // Unreplied customer messages: sent strictly AFTER the latest agent message (+ tolerance)
+    const unrepliedCustomerMessages = customerMessages.filter(msg => {
+      return getMessageTimestamp(msg) > (lastAgentTime + SIMULTANEOUS_TOLERANCE_MS)
+    })
+
+    const newCustomerMessagesSinceLastReply = unrepliedCustomerMessages.length
+
+    // Check targetMessageId (e.g. from background queue worker)
+    let targetMessage: any = null
+    let targetMessageAddressed: boolean | null = null
+
+    if (options.targetMessageId) {
+      targetMessage = rawList.find(m => m.id === options.targetMessageId) || null
+      if (targetMessage) {
+        const targetTime = getMessageTimestamp(targetMessage)
+        targetMessageAddressed = lastAgentReply ? (targetTime <= lastAgentTime + SIMULTANEOUS_TOLERANCE_MS) : false
+      }
+    }
+
+    // Check echo / repetition of currentMessageText
+    let isCurrentMessageEcho = false
+    if (options.currentMessageText && lastAgentText) {
+      const curNorm = options.currentMessageText.trim().toLowerCase()
+      const agNorm = lastAgentText.trim().toLowerCase()
+      if (curNorm.length > 0 && (curNorm === agNorm || agNorm.includes(curNorm) || curNorm.includes(agNorm))) {
+        isCurrentMessageEcho = true
+      }
+    }
+
+    let allRecentCustomerMessagesAddressed: boolean
+    let needsReply: boolean
+    let recommendedAction: 'REPLY' | 'NO_REPLY'
+    let reason: string
+
+    if (isCurrentMessageEcho) {
+      allRecentCustomerMessagesAddressed = true
+      needsReply = false
+      recommendedAction = 'NO_REPLY'
+      reason = 'Nội dung tin nhắn trùng khớp với phản hồi gần nhất của Agent (outgoing echo/phản hồi lặp lại).'
+    } else if (targetMessage) {
+      if (targetMessageAddressed) {
+        allRecentCustomerMessagesAddressed = true
+        needsReply = false
+        recommendedAction = 'NO_REPLY'
+        reason = `Target message '${options.targetMessageId}' (sent ${new Date(getMessageTimestamp(targetMessage)).toISOString()}) has already been addressed by agent reply '${lastAgentReply.id}' sent at ${new Date(lastAgentTime).toISOString()}.`
+      } else {
+        allRecentCustomerMessagesAddressed = false
+        needsReply = true
+        recommendedAction = 'REPLY'
+        reason = `Target message '${options.targetMessageId}' was sent AFTER the last agent reply and requires attention.`
+      }
+    } else {
+      if (customerMessages.length === 0) {
+        allRecentCustomerMessagesAddressed = true
+        needsReply = false
+        recommendedAction = 'NO_REPLY'
+        reason = 'No customer messages in thread.'
+      } else if (!lastAgentReply) {
+        allRecentCustomerMessagesAddressed = false
+        needsReply = true
+        recommendedAction = 'REPLY'
+        reason = `Customer has sent ${customerMessages.length} message(s) with no prior agent replies.`
+      } else if (newCustomerMessagesSinceLastReply === 0) {
+        allRecentCustomerMessagesAddressed = true
+        needsReply = false
+        recommendedAction = 'NO_REPLY'
+        const isNearSimultaneous = customerMessages.some(m => {
+          const t = getMessageTimestamp(m)
+          return t > lastAgentTime && t <= (lastAgentTime + SIMULTANEOUS_TOLERANCE_MS)
+        })
+        reason = isNearSimultaneous
+          ? `Tất cả tin nhắn khách hàng gần đây đều có timestamp trước hoặc gần như đồng thời (trong vòng 5s) so với thời điểm Agent phản hồi '${lastAgentReply.id}' lúc ${new Date(lastAgentTime).toISOString()}, và Agent đã có nội dung trả lời.`
+          : `All recent customer messages were sent prior to agent reply '${lastAgentReply.id}' sent at ${new Date(lastAgentTime).toISOString()}. No new messages from customer since.`
+      } else {
+        allRecentCustomerMessagesAddressed = false
+        needsReply = true
+        recommendedAction = 'REPLY'
+        reason = `Customer sent ${newCustomerMessagesSinceLastReply} new message(s) since last agent reply at ${new Date(lastAgentTime).toISOString()}.`
+      }
+    }
+
+    // Check if the only pending message is a brief courtesy acknowledgement
+    let isClosingRemark = false
+    if (options.enableAckDetection && needsReply && unrepliedCustomerMessages.length === 1) {
+      const pendingText = getMessageText(unrepliedCustomerMessages[0])
+      if (isAcknowledgementMessage(pendingText)) {
+        isClosingRemark = true
+        allRecentCustomerMessagesAddressed = true
+        needsReply = false
+        recommendedAction = 'NO_REPLY'
+        reason = `Customer message '${unrepliedCustomerMessages[0].id}' is a courtesy closing remark ("${pendingText}"). No further reply needed.`
+      }
+    }
+
+    const lastAgentSummary = lastAgentReply ? {
+      id: lastAgentReply.id,
+      text: lastAgentText,
+      createdAt: lastAgentReply.createdAt || lastAgentReply.timestamp,
+      createdBy: lastAgentReply.createdBy,
+      direction: lastAgentReply.direction,
+      timestamp: lastAgentTime
+    } : null
+
+    const lastCustomerSummary = lastCustomerMessage ? {
+      id: lastCustomerMessage.id,
+      text: getMessageText(lastCustomerMessage),
+      createdAt: lastCustomerMessage.createdAt || lastCustomerMessage.timestamp,
+      createdBy: lastCustomerMessage.createdBy,
+      direction: lastCustomerMessage.direction,
+      timestamp: getMessageTimestamp(lastCustomerMessage)
+    } : null
+
+    const unrepliedFormatted = unrepliedCustomerMessages.map(m => ({
+      id: m.id,
+      text: getMessageText(m),
+      createdAt: m.createdAt || m.timestamp,
+      createdBy: m.createdBy,
+      direction: m.direction,
+      timestamp: getMessageTimestamp(m)
+    }))
+
+    const guidance = recommendedAction === 'NO_REPLY'
+      ? `[ANTI-DUPLICATION NOTICE] This message or topic has already been addressed by agent reply at ${lastAgentReply ? new Date(lastAgentTime).toISOString() : 'N/A'}. Do NOT send a duplicate message. Return NO_REPLY. Nếu câu hỏi/ý kiến của khách đã được giải quyết trong lastAgentMessage, LLM BẮT BUỘC trả về NO_REPLY để tránh lặp lại thông điệp (chẳng hạn chúc an toàn lặp lại, chào lặp lại).`
+      : `Khách hàng có tin nhắn mới cần giải quyết. Tin nhắn mới nhất: "${unrepliedFormatted[unrepliedFormatted.length - 1]?.text}". LLM cần tập trung trả lời đúng câu hỏi mới, TUYỆT ĐỐI KHÔNG lặp lại câu chúc hoặc câu chào đã gửi trong tin nhắn trước của Agent ("${lastAgentText.slice(0, 100)}..."). Nếu ý kiến của khách đã được giải quyết trọn vẹn, LLM BẮT BUỘC trả về NO_REPLY.`
+
+    const alreadyAddressedGuidance = recommendedAction === 'NO_REPLY' ? guidance : null
+
+    return {
+      allRecentCustomerMessagesAddressed,
+      needsReply,
+      recommendedAction,
+      reason,
+      isClosingRemark,
+      totalMessages: sortedAsc.length,
+      newCustomerMessagesSinceLastReply,
+      lastAgentMessage: lastAgentSummary,
+      lastAgentReply: lastAgentSummary,
+      lastCustomerMessage: lastCustomerSummary,
+      unrepliedCustomerMessages: unrepliedFormatted,
+      unrepliedMessages: unrepliedFormatted,
+      guidance,
+      alreadyAddressedGuidance
+    }
+  }
+
   server.tool(
     "conversations_get_thread_messages",
-    "Retrieve all messages from a conversation thread (e.g. Facebook Messenger, live chat, email) in HubSpot Inbox. Returns sender, text content, timestamps, and message direction. Note: threadId MUST be a HubSpot conversation thread ID (e.g. '11207036290'). Do NOT pass a CRM Contact ID or email here. If you only have a contact ID/email, use conversations_list_threads or conversations_get_contact_messages first. (If a contact ID/email is mistakenly passed, this tool will attempt to auto-resolve to the contact's latest conversation thread).",
+    "Retrieve all messages from a conversation thread (e.g. Facebook Messenger, live chat, email) in HubSpot Inbox. Returns sender, text content, timestamps, message direction, and antiDuplicationContext. Note: threadId MUST be a HubSpot conversation thread ID (e.g. '11207036290'). Do NOT pass a CRM Contact ID or email here. If you only have a contact ID/email, use conversations_list_threads or conversations_get_contact_messages first. (If a contact ID/email is mistakenly passed, this tool will attempt to auto-resolve to the contact's latest conversation thread).",
     {
       threadId: z.string().describe("The HubSpot conversation thread ID (e.g. '11207036290')"),
       limit: z.number().optional().describe("Maximum number of messages to return (max 100)"),
-      sort: z.enum(["ASCENDING", "DESCENDING"]).optional().describe("Sort messages by creation timestamp")
+      sort: z.enum(["ASCENDING", "DESCENDING"]).optional().describe("Sort messages by creation timestamp (default DESCENDING)")
     },
     async (params) => handleEndpoint(async () => {
       const endpoint = `/conversations/v3/conversations/threads/${params.threadId}/messages`
       const queryParams: Record<string, any> = {}
       if (params.limit !== undefined) queryParams.limit = params.limit
-      if (params.sort !== undefined) queryParams.sort = params.sort
+      // DO NOT pass sort to queryParams: HubSpot endpoint returns 400 Bad Request if sort query param is passed
       const result = await makeApiRequest(hubspotAccessToken, endpoint, queryParams, 'GET')
 
       // Auto-fallback: If 404, check if params.threadId is actually a contact ID or email
@@ -2691,6 +2971,8 @@ function createServer({ config }: { config?: any } = {}) {
           const latestThread = contactThreads[0]
           const resolvedEndpoint = `/conversations/v3/conversations/threads/${latestThread.id}/messages`
           const threadMsgResult = await makeApiRequest(hubspotAccessToken, resolvedEndpoint, queryParams, 'GET')
+          const sortedThreadMsgResult = applySortToMessagesResult(threadMsgResult, params.sort || 'DESCENDING')
+          const antiDuplicationContext = computeAntiDuplicationContext(sortedThreadMsgResult, { enableAckDetection: true })
           return formatResponse({
             notice: `[AUTO-RECOVERED] The provided threadId '${params.threadId}' was not found as a thread ID because it is a CRM Contact ID (or Email). Auto-resolved to this contact's latest active conversation thread '${latestThread.id}'. Total threads found for contact: ${contactThreads.length}.`,
             resolvedThreadId: latestThread.id,
@@ -2702,7 +2984,8 @@ function createServer({ config }: { config?: any } = {}) {
               channelId: t.originalChannelId,
               latestMessageTimestamp: t.latestMessageTimestamp
             })),
-            messages: threadMsgResult
+            messages: sortedThreadMsgResult,
+            antiDuplicationContext
           })
         } else {
           return formatResponse({
@@ -2711,7 +2994,24 @@ function createServer({ config }: { config?: any } = {}) {
         }
       }
 
-      return formatResponse(result)
+      if (typeof result === 'string') {
+        return formatResponse(result)
+      }
+
+      const sortedResult = applySortToMessagesResult(result, params.sort || 'DESCENDING')
+      const antiDuplicationContext = computeAntiDuplicationContext(sortedResult, { enableAckDetection: true })
+
+      if (sortedResult && typeof sortedResult === 'object' && !Array.isArray(sortedResult)) {
+        return formatResponse({
+          ...sortedResult,
+          antiDuplicationContext
+        })
+      }
+
+      return formatResponse({
+        messages: sortedResult,
+        antiDuplicationContext
+      })
     })
   )
 
@@ -2752,7 +3052,7 @@ function createServer({ config }: { config?: any } = {}) {
 
   server.tool(
     "conversations_list_threads",
-    "List conversation threads in HubSpot Conversations Inbox. Can filter by contact ID or email (associatedContactId). Automatically resolves and aggregates threads across all merged contact profiles (hs_all_contact_vids) sorted with latest active conversations first. Also automatically preloads recent messages from the latest active thread so you do not need to call another tool.",
+    "List conversation threads in HubSpot Conversations Inbox. Can filter by contact ID or email (associatedContactId). Automatically resolves and aggregates threads across all merged contact profiles (hs_all_contact_vids) sorted with latest active conversations first. Also automatically preloads recent messages and antiDuplicationContext from the latest active thread so you do not need to call another tool.",
     {
       associatedContactId: z.string().optional().describe("Filter threads by HubSpot contact ID or contact email. Automatically resolves merged contact profiles."),
       limit: z.number().optional().describe("Maximum number of threads to return (max 100)"),
@@ -2762,11 +3062,15 @@ function createServer({ config }: { config?: any } = {}) {
       if (params.associatedContactId) {
         const { threads, allVids } = await resolveThreadsForContact(hubspotAccessToken, params.associatedContactId, params.limit || 50)
         let latestThreadMessages: any = null
+        let antiDuplicationContext: any = null
         const shouldIncludeMessages = params.includeLatestMessages !== false
         if (shouldIncludeMessages && threads.length > 0) {
           const latestThreadId = threads[0].id
           const msgEndpoint = `/conversations/v3/conversations/threads/${latestThreadId}/messages`
-          latestThreadMessages = await makeApiRequest(hubspotAccessToken, msgEndpoint, { limit: 20, sort: 'DESCENDING' }, 'GET')
+          // HubSpot messages endpoint does not accept sort param; request without sort, then sort in-memory
+          const rawMessages = await makeApiRequest(hubspotAccessToken, msgEndpoint, { limit: 20 }, 'GET')
+          latestThreadMessages = applySortToMessagesResult(rawMessages, 'DESCENDING')
+          antiDuplicationContext = computeAntiDuplicationContext(latestThreadMessages, { enableAckDetection: true })
         }
         return formatResponse({
           notice: `All conversation threads across all merged contact profiles (${allVids.join(', ')}) are ALREADY aggregated in this result. DO NOT call conversations_list_threads again for any of these merged IDs. The latest thread '${threads[0]?.id}' messages are preloaded below in 'latestThreadMessages'.`,
@@ -2774,7 +3078,8 @@ function createServer({ config }: { config?: any } = {}) {
           total: threads.length,
           results: threads,
           latestThreadId: threads[0]?.id,
-          latestThreadMessages: latestThreadMessages
+          latestThreadMessages: latestThreadMessages,
+          antiDuplicationContext: antiDuplicationContext
         })
       }
 
@@ -2787,7 +3092,7 @@ function createServer({ config }: { config?: any } = {}) {
 
   server.tool(
     "conversations_get_contact_messages",
-    "Retrieve conversation messages directly for a customer by contact ID or email across all channels (Facebook Messenger, Live Chat) in HubSpot. Đọc các đoạn hội thoại, tin nhắn chat của khách hàng. Automatically aggregates all threads across all merged contact profiles (hs_all_contact_vids) and returns messages from the most recent active conversation in a single call. Use this whenever asked to read conversation history, chat messages, or 'đọc các đoạn hội thoại của khách hàng' without needing a thread ID.",
+    "Retrieve conversation messages directly for a customer by contact ID or email across all channels (Facebook Messenger, Live Chat) in HubSpot. Đọc các đoạn hội thoại, tin nhắn chat của khách hàng. Automatically aggregates all threads across all merged contact profiles (hs_all_contact_vids) and returns messages and antiDuplicationContext from the most recent active conversation in a single call. Use this whenever asked to read conversation history, chat messages, or 'đọc các đoạn hội thoại của khách hàng' without needing a thread ID.",
     {
       contactIdOrEmail: z.string().describe("Customer HubSpot contact ID (e.g. '252745349968') or email (e.g. 'thecuongnguyen789@gmail.com')"),
       limit: z.number().optional().describe("Maximum number of messages to return (max 100, default 20)"),
@@ -2799,7 +3104,8 @@ function createServer({ config }: { config?: any } = {}) {
         return formatResponse({
           notice: `No conversation threads found in HubSpot Conversations Inbox for contact '${params.contactIdOrEmail}' (checked VIDs: ${allVids.join(', ')}). Note: This contact has no Live Chat/Messenger inbox threads. To check email or engagement history in CRM, use crm_get_associations with toObjectType: 'emails' or 'notes'.`,
           contactVidsResolved: allVids,
-          messages: []
+          messages: [],
+          antiDuplicationContext: computeAntiDuplicationContext([], { enableAckDetection: true })
         })
       }
 
@@ -2807,8 +3113,13 @@ function createServer({ config }: { config?: any } = {}) {
       const msgEndpoint = `/conversations/v3/conversations/threads/${latestThread.id}/messages`
       const queryParams: Record<string, any> = {}
       if (params.limit !== undefined) queryParams.limit = params.limit
-      if (params.sort !== undefined) queryParams.sort = params.sort
+      // DO NOT pass sort to queryParams
       const msgResult = await makeApiRequest(hubspotAccessToken, msgEndpoint, queryParams, 'GET')
+      if (typeof msgResult === 'string') {
+        return formatResponse(msgResult)
+      }
+      const sortedMsgResult = applySortToMessagesResult(msgResult, params.sort || 'DESCENDING')
+      const antiDuplicationContext = computeAntiDuplicationContext(sortedMsgResult, { enableAckDetection: true })
 
       return formatResponse({
         notice: `Retrieved messages from latest active thread '${latestThread.id}' (channel: ${latestThread.originalChannelId}, contact VID: ${latestThread.associatedContactId}). All merged VIDs checked: ${allVids.join(', ')}. Total threads found: ${threads.length}.`,
@@ -2821,7 +3132,71 @@ function createServer({ config }: { config?: any } = {}) {
           channelId: t.originalChannelId,
           latestMessageTimestamp: t.latestMessageTimestamp
         })),
-        messages: msgResult
+        messages: sortedMsgResult,
+        antiDuplicationContext
+      })
+    })
+  )
+
+  server.tool(
+    "conversations_check_reply_needed",
+    "Evaluate whether a conversation thread currently requires a reply from Agent/Bot or should return NO_REPLY to prevent duplicate messaging. Analyzes recent incoming vs outgoing messages, compares timestamps, inspects the last agent message, and identifies unreplied customer inquiries.",
+    {
+      threadId: z.string().describe("The HubSpot conversation thread ID (or Contact ID / Email for auto-resolution)"),
+      currentMessageText: z.string().optional().describe("Optional text of the incoming message or candidate reply to check against the last sent agent message to avoid echoes or repetition")
+    },
+    async (params) => handleEndpoint(async () => {
+      let actualThreadId = params.threadId
+      const msgEndpoint = `/conversations/v3/conversations/threads/${actualThreadId}/messages`
+      let msgResult = await makeApiRequest(hubspotAccessToken, msgEndpoint, { limit: 20 }, 'GET')
+
+      // Auto-fallback: If 404 or threadId is contactId / email
+      if (typeof msgResult === 'string' && msgResult.includes('Status 404')) {
+        const { threads: contactThreads } = await resolveThreadsForContact(hubspotAccessToken, params.threadId)
+        if (contactThreads.length > 0) {
+          actualThreadId = contactThreads[0].id
+          const resolvedEndpoint = `/conversations/v3/conversations/threads/${actualThreadId}/messages`
+          msgResult = await makeApiRequest(hubspotAccessToken, resolvedEndpoint, { limit: 20 }, 'GET')
+        } else {
+          return formatResponse({
+            threadId: params.threadId,
+            needsReply: false,
+            reason: `Thread ID '${params.threadId}' was not found (Status 404) and no conversation threads were found for this contact.`,
+            recommendedAction: "NO_REPLY",
+            allRecentCustomerMessagesAddressed: true,
+            lastAgentMessage: null,
+            lastAgentReply: null,
+            unrepliedMessages: [],
+            unrepliedCustomerMessages: [],
+            guidance: "Không tìm thấy thread hoặc tin nhắn nào. Trả về NO_REPLY."
+          })
+        }
+      }
+
+      if (typeof msgResult === 'string') {
+        return formatResponse({
+          threadId: actualThreadId,
+          error: msgResult
+        })
+      }
+
+      const sortedMessages = sortMessages(extractMessagesList(msgResult), 'DESCENDING')
+      const antiDup = computeAntiDuplicationContext(sortedMessages, {
+        currentMessageText: params.currentMessageText,
+        enableAckDetection: true
+      })
+
+      return formatResponse({
+        threadId: actualThreadId,
+        needsReply: antiDup.needsReply,
+        reason: antiDup.reason,
+        recommendedAction: antiDup.recommendedAction,
+        allRecentCustomerMessagesAddressed: antiDup.allRecentCustomerMessagesAddressed,
+        lastAgentMessage: antiDup.lastAgentMessage,
+        lastAgentReply: antiDup.lastAgentReply,
+        unrepliedMessages: antiDup.unrepliedMessages,
+        unrepliedCustomerMessages: antiDup.unrepliedCustomerMessages,
+        guidance: antiDup.guidance
       })
     })
   )
