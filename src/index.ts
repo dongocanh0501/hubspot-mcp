@@ -2598,11 +2598,75 @@ function createServer({ config }: { config?: any } = {}) {
   // Conversations API (Messenger / Live Chat)
   // ==========================================
 
+  async function resolveThreadsForContact(token: string, contactIdOrEmail: string, limit = 50) {
+    if (!token || !contactIdOrEmail) return []
+    const allVids = new Set<string>()
+    try {
+      const isEmail = contactIdOrEmail.includes("@")
+      const queryParams: Record<string, string> = {
+        properties: "hs_all_contact_vids,hs_merged_object_ids,email"
+      }
+      if (isEmail) queryParams.idProperty = "email"
+
+      const queryStr = new URLSearchParams(queryParams).toString()
+      const contactUrl = `https://api.hubapi.com/crm/v3/objects/contacts/${encodeURIComponent(contactIdOrEmail)}?${queryStr}`
+      const contactRes = await fetch(contactUrl, {
+        headers: {
+          'Accept': 'application/json',
+          'Authorization': `Bearer ${token}`
+        }
+      })
+      if (contactRes.ok) {
+        const contactData: any = await contactRes.json()
+        if (contactData.id) allVids.add(String(contactData.id))
+        if (contactData.properties?.hs_all_contact_vids) {
+          contactData.properties.hs_all_contact_vids.split(";").map((v: string) => v.trim()).filter(Boolean).forEach((v: string) => allVids.add(v))
+        }
+        if (contactData.properties?.hs_merged_object_ids) {
+          contactData.properties.hs_merged_object_ids.split(";").map((v: string) => v.trim()).filter(Boolean).forEach((v: string) => allVids.add(v))
+        }
+      }
+    } catch {
+      // ignore
+    }
+
+    if (allVids.size === 0) allVids.add(contactIdOrEmail)
+
+    const threadsMap = new Map<string, any>()
+    for (const vid of allVids) {
+      try {
+        const threadUrl = `https://api.hubapi.com/conversations/v3/conversations/threads?associatedContactId=${encodeURIComponent(vid)}`
+        const threadRes = await fetch(threadUrl, {
+          headers: {
+            'Accept': 'application/json',
+            'Authorization': `Bearer ${token}`
+          }
+        })
+        if (threadRes.ok) {
+          const threadData: any = await threadRes.json()
+          for (const t of (threadData.results || [])) {
+            threadsMap.set(t.id, t)
+          }
+        }
+      } catch {
+        // ignore
+      }
+    }
+
+    const threads = Array.from(threadsMap.values()).sort((a, b) => {
+      const tA = new Date(a.latestMessageTimestamp || a.createdAt || 0).getTime()
+      const tB = new Date(b.latestMessageTimestamp || b.createdAt || 0).getTime()
+      return tB - tA
+    })
+
+    return threads.slice(0, limit)
+  }
+
   server.tool(
     "conversations_get_thread_messages",
-    "Retrieve all messages from a conversation thread (e.g. Facebook Messenger, live chat, email) in HubSpot Inbox. Returns sender, text content, timestamps, and message direction.",
+    "Retrieve all messages from a conversation thread (e.g. Facebook Messenger, live chat, email) in HubSpot Inbox. Returns sender, text content, timestamps, and message direction. Note: threadId MUST be a HubSpot conversation thread ID (e.g. '11207036290'). Do NOT pass a CRM Contact ID or email here. If you only have a contact ID/email, use conversations_list_threads first. (If a contact ID/email is mistakenly passed, this tool will attempt to auto-resolve to the contact's latest conversation thread).",
     {
-      threadId: z.string().describe("The HubSpot conversation thread ID"),
+      threadId: z.string().describe("The HubSpot conversation thread ID (e.g. '11207036290')"),
       limit: z.number().optional().describe("Maximum number of messages to return (max 100)"),
       sort: z.enum(["ASCENDING", "DESCENDING"]).optional().describe("Sort messages by creation timestamp")
     },
@@ -2611,33 +2675,92 @@ function createServer({ config }: { config?: any } = {}) {
       const queryParams: Record<string, any> = {}
       if (params.limit !== undefined) queryParams.limit = params.limit
       if (params.sort !== undefined) queryParams.sort = params.sort
-      return await makeApiRequestWithErrorHandling(hubspotAccessToken, endpoint, queryParams, 'GET')
+      const result = await makeApiRequest(hubspotAccessToken, endpoint, queryParams, 'GET')
+
+      // Auto-fallback: If 404, check if params.threadId is actually a contact ID or email
+      if (typeof result === 'string' && result.includes('Status 404')) {
+        const contactThreads = await resolveThreadsForContact(hubspotAccessToken, params.threadId)
+        if (contactThreads.length > 0) {
+          const latestThread = contactThreads[0]
+          const resolvedEndpoint = `/conversations/v3/conversations/threads/${latestThread.id}/messages`
+          const threadMsgResult = await makeApiRequest(hubspotAccessToken, resolvedEndpoint, queryParams, 'GET')
+          return formatResponse({
+            notice: `[AUTO-RECOVERED] The provided threadId '${params.threadId}' was not found as a thread ID because it is a CRM Contact ID (or Email). Auto-resolved to this contact's latest active conversation thread '${latestThread.id}'. Total threads found for contact: ${contactThreads.length}.`,
+            resolvedThreadId: latestThread.id,
+            associatedContactId: latestThread.associatedContactId,
+            channelId: latestThread.originalChannelId,
+            allThreads: contactThreads.map((t: any) => ({
+              threadId: t.id,
+              associatedContactId: t.associatedContactId,
+              channelId: t.originalChannelId,
+              latestMessageTimestamp: t.latestMessageTimestamp
+            })),
+            messages: threadMsgResult
+          })
+        } else {
+          return formatResponse({
+            error: `Thread ID '${params.threadId}' was not found (Status 404). Note: If '${params.threadId}' is a Contact ID, this contact has no active Live Chat/Messenger conversation threads in HubSpot Inbox. To check email or engagement history, use crm_get_associations with toObjectType: 'emails' or 'notes'.`
+          })
+        }
+      }
+
+      return formatResponse(result)
     })
   )
 
   server.tool(
     "conversations_get_thread",
-    "Get details of a specific conversation thread including channel ID, associated contact ID, inbox ID, and status.",
+    "Get details of a specific conversation thread including channel ID, associated contact ID, inbox ID, and status. Note: threadId MUST be a HubSpot conversation thread ID (e.g. '11207036290'). Do NOT pass a CRM Contact ID or email here. If you only have a contact ID/email, use conversations_list_threads first.",
     {
-      threadId: z.string().describe("The HubSpot conversation thread ID")
+      threadId: z.string().describe("The HubSpot conversation thread ID (e.g. '11207036290')")
     },
     async (params) => handleEndpoint(async () => {
       const endpoint = `/conversations/v3/conversations/threads/${params.threadId}`
-      return await makeApiRequestWithErrorHandling(hubspotAccessToken, endpoint, {}, 'GET')
+      const result = await makeApiRequest(hubspotAccessToken, endpoint, {}, 'GET')
+
+      if (typeof result === 'string' && result.includes('Status 404')) {
+        const contactThreads = await resolveThreadsForContact(hubspotAccessToken, params.threadId)
+        if (contactThreads.length > 0) {
+          const latestThread = contactThreads[0]
+          return formatResponse({
+            notice: `[AUTO-RECOVERED] The provided threadId '${params.threadId}' was not found as a thread ID because it is a CRM Contact ID (or Email). Auto-resolved to this contact's latest active conversation thread '${latestThread.id}'. Total threads found for contact: ${contactThreads.length}.`,
+            resolvedThread: latestThread,
+            allThreads: contactThreads.map((t: any) => ({
+              threadId: t.id,
+              associatedContactId: t.associatedContactId,
+              channelId: t.originalChannelId,
+              latestMessageTimestamp: t.latestMessageTimestamp
+            }))
+          })
+        } else {
+          return formatResponse({
+            error: `Thread ID '${params.threadId}' was not found (Status 404). Note: If '${params.threadId}' is a Contact ID, this contact has no active Live Chat/Messenger conversation threads in HubSpot Inbox.`
+          })
+        }
+      }
+
+      return formatResponse(result)
     })
   )
 
   server.tool(
     "conversations_list_threads",
-    "List conversation threads in HubSpot Conversations Inbox, optionally filtered by associated contact ID or status.",
+    "List conversation threads in HubSpot Conversations Inbox. Can filter by contact ID or email (associatedContactId). Automatically resolves and includes threads across all merged contact profiles (hs_all_contact_vids) sorted with latest active conversations first.",
     {
-      associatedContactId: z.string().optional().describe("Filter threads by HubSpot associated contact ID"),
+      associatedContactId: z.string().optional().describe("Filter threads by HubSpot contact ID or contact email. Automatically resolves merged contact profiles."),
       limit: z.number().optional().describe("Maximum number of threads to return (max 100)")
     },
     async (params) => handleEndpoint(async () => {
+      if (params.associatedContactId) {
+        const threads = await resolveThreadsForContact(hubspotAccessToken, params.associatedContactId, params.limit || 50)
+        return formatResponse({
+          total: threads.length,
+          results: threads
+        })
+      }
+
       const endpoint = '/conversations/v3/conversations/threads'
       const queryParams: Record<string, any> = {}
-      if (params.associatedContactId !== undefined) queryParams.associatedContactId = params.associatedContactId
       if (params.limit !== undefined) queryParams.limit = params.limit
       return await makeApiRequestWithErrorHandling(hubspotAccessToken, endpoint, queryParams, 'GET')
     })
