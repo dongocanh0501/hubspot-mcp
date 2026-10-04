@@ -100,12 +100,33 @@ export function isAgentMessage(msg) {
 export function isHumanAgentMessage(msg) {
   if (!msg) return false;
   if (typeof msg.direction === 'string' && msg.direction.toUpperCase() === 'INCOMING') return false;
-  const clientType = (msg.client?.clientType || '').toUpperCase();
-  if (clientType === 'HUBSPOT') return true;
-  if (clientType === 'SYSTEM' && typeof msg.direction === 'string' && msg.direction.toUpperCase() === 'OUTGOING') return true;
-  if (clientType === 'INTEGRATION') return false;
+
   const actorId = msg.senders?.[0]?.actorId || msg.createdBy || msg.actorId || '';
+  const createdBy = msg.createdBy || '';
+
+  // 1. Explicit BOT exclusions: any B- prefix or BOT identifier is NEVER a human agent
+  if (typeof actorId === 'string' && (actorId.startsWith('B-') || actorId.toUpperCase().includes('BOT'))) {
+    return false;
+  }
+  if (typeof createdBy === 'string' && (createdBy.startsWith('B-') || createdBy.toUpperCase().includes('BOT'))) {
+    return false;
+  }
+
+  const clientType = (msg.client?.clientType || '').toUpperCase();
+  if (clientType === 'INTEGRATION') return false;
+
+  // 2. Explicit HUMAN AGENT markers:
   if (typeof actorId === 'string' && actorId.startsWith('A-')) return true;
+  if (typeof createdBy === 'string' && createdBy.startsWith('A-')) return true;
+  if (clientType === 'HUBSPOT') return true;
+
+  // 3. SYSTEM clientType: only human if OUTGOING and from Meta Business Suite (e.g. S-hubspot) and not a bot
+  if (clientType === 'SYSTEM' && typeof msg.direction === 'string' && msg.direction.toUpperCase() === 'OUTGOING') {
+    if (createdBy.startsWith('S-') || (typeof actorId === 'string' && actorId.startsWith('S-'))) {
+      return true;
+    }
+  }
+
   return false;
 }
 
@@ -798,6 +819,35 @@ runTest('Test Case 6D: Bot message (clientType: "INTEGRATION") does NOT trigger 
   assert.equal(context.needsReply, true, 'Bot reply does not trigger human cooldown; new customer inquiry requires reply');
   assert.equal(context.recommendedAction, 'REPLY');
 });
+
+runTest('Test Case 6E: Facebook Page Instant Reply Bot (createdBy: "B-105195004", clientType: "SYSTEM") does NOT trigger human takeover cooldown', () => {
+  const fbBotGreeting = {
+    id: '34900992-56e0-4782-b5fd-0d792108470d',
+    direction: 'OUTGOING',
+    createdBy: 'B-105195004',
+    client: { clientType: 'SYSTEM' },
+    senders: [{ actorId: 'B-105195004' }],
+    createdAt: new Date(Date.now() - 5 * 60 * 1000).toISOString(),
+    text: "Hi, thanks for messaging us. We try to be as responsive as possible. We'll get back to you soon."
+  };
+
+  const customerQuestion = {
+    id: '216effd7-daa6-4b89-b3bd-da0f0b5e4df3',
+    direction: 'INCOMING',
+    createdBy: 'V-252913596963',
+    senders: [{ actorId: 'V-252913596963' }],
+    createdAt: new Date(Date.now() - 2 * 60 * 1000).toISOString(),
+    text: 'mất bao lâu bán đc 1 tỉ gói mè'
+  };
+
+  const context = computeAntiDuplicationContext([fbBotGreeting, customerQuestion]);
+
+  assert.equal(isHumanAgentMessage(fbBotGreeting), false, 'Facebook bot greeting must NOT be classified as human');
+  assert.equal(context.needsReply, true, 'Customer message after FB automated bot greeting must require reply');
+  assert.equal(context.recommendedAction, 'REPLY');
+});
+
+
 
 // ----------------------------------------------------------------------------
 // Summary

@@ -2750,12 +2750,34 @@ function createServer({ config }: { config?: any } = {}) {
   function isHumanAgentMessage(msg: any): boolean {
     if (!msg) return false
     if (typeof msg.direction === 'string' && msg.direction.toUpperCase() === 'INCOMING') return false
-    const clientType = (msg.client?.clientType || '').toUpperCase()
-    if (clientType === 'HUBSPOT') return true
-    if (clientType === 'SYSTEM' && typeof msg.direction === 'string' && msg.direction.toUpperCase() === 'OUTGOING') return true
-    if (clientType === 'INTEGRATION') return false
+
     const actorId = msg.senders?.[0]?.actorId || msg.createdBy || msg.actorId || ''
+    const createdBy = msg.createdBy || ''
+
+    // 1. Explicit BOT exclusions: any B- prefix or BOT identifier is NEVER a human agent
+    if (typeof actorId === 'string' && (actorId.startsWith('B-') || actorId.toUpperCase().includes('BOT'))) {
+      return false
+    }
+    if (typeof createdBy === 'string' && (createdBy.startsWith('B-') || createdBy.toUpperCase().includes('BOT'))) {
+      return false
+    }
+
+    const clientType = (msg.client?.clientType || '').toUpperCase()
+    if (clientType === 'INTEGRATION') return false
+
+    // 2. Explicit HUMAN AGENT markers:
+    // A- prefix in actorId/createdBy, or HUBSPOT clientType (HubSpot Web/Mobile Inbox)
     if (typeof actorId === 'string' && actorId.startsWith('A-')) return true
+    if (typeof createdBy === 'string' && createdBy.startsWith('A-')) return true
+    if (clientType === 'HUBSPOT') return true
+
+    // 3. SYSTEM clientType: only human if OUTGOING and from Meta Business Suite (e.g. S-hubspot) and not a bot
+    if (clientType === 'SYSTEM' && typeof msg.direction === 'string' && msg.direction.toUpperCase() === 'OUTGOING') {
+      if (createdBy.startsWith('S-') || (typeof actorId === 'string' && actorId.startsWith('S-'))) {
+        return true
+      }
+    }
+
     return false
   }
 
