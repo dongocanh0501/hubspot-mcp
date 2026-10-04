@@ -92,6 +92,24 @@ export function isAgentMessage(msg) {
 }
 
 /**
+ * Determines whether a message originates from an actual human staff member.
+ *
+ * @param {object} msg
+ * @returns {boolean} True if human agent
+ */
+export function isHumanAgentMessage(msg) {
+  if (!msg) return false;
+  if (typeof msg.direction === 'string' && msg.direction.toUpperCase() === 'INCOMING') return false;
+  const clientType = (msg.client?.clientType || '').toUpperCase();
+  if (clientType === 'HUBSPOT') return true;
+  if (clientType === 'SYSTEM' && typeof msg.direction === 'string' && msg.direction.toUpperCase() === 'OUTGOING') return true;
+  if (clientType === 'INTEGRATION') return false;
+  const actorId = msg.senders?.[0]?.actorId || msg.createdBy || msg.actorId || '';
+  if (typeof actorId === 'string' && actorId.startsWith('A-')) return true;
+  return false;
+}
+
+/**
  * Common short acknowledgment or closing phrases in Vietnamese.
  */
 const CLOSING_PHRASES = [
@@ -142,12 +160,45 @@ export function getMessageText(msg) {
  * @param {string} [optionsOrCurrentText.targetMessageId] - ID of the specific message dequeued for execution
  * @param {string} [optionsOrCurrentText.currentMessageText] - Current incoming or candidate text
  * @param {boolean} [optionsOrCurrentText.enableAckDetection=false] - Check for closing/ack phrases
+ * @param {string|null} [optionsOrCurrentText.assignedTo=null] - User ID assigned to this thread
+ * @param {string|null} [optionsOrCurrentText.threadStatus=null] - OPEN or CLOSED
+ * @param {number} [optionsOrCurrentText.humanCooldownMinutes=30] - Takeover cooldown minutes
  * @returns {object} AntiDuplicationContext
  */
 export function computeAntiDuplicationContext(input, optionsOrCurrentText = {}) {
   const options = typeof optionsOrCurrentText === 'string'
     ? { currentMessageText: optionsOrCurrentText }
     : (optionsOrCurrentText || {});
+
+  // 1. Thread Status Check
+  if (options.threadStatus && options.threadStatus.toUpperCase() === 'CLOSED') {
+    return {
+      allRecentCustomerMessagesAddressed: true,
+      needsReply: false,
+      recommendedAction: 'NO_REPLY',
+      reason: 'Hội thoại đã đóng (status: CLOSED). AI Bot không được gửi tin nhắn vào thread đã đóng.',
+      lastAgentMessage: null,
+      lastAgentReply: null,
+      unrepliedMessages: [],
+      unrepliedCustomerMessages: [],
+      guidance: 'Thread đã đóng. BẮT BUỘC trả về NO_REPLY.'
+    };
+  }
+
+  // 2. Thread Assignment Check
+  if (options.assignedTo && typeof options.assignedTo === 'string' && options.assignedTo.trim() !== '') {
+    return {
+      allRecentCustomerMessagesAddressed: true,
+      needsReply: false,
+      recommendedAction: 'NO_REPLY',
+      reason: `Hội thoại này đã được phân công cho nhân viên hỗ trợ (${options.assignedTo}). AI Bot tuyệt đối không được chen ngang.`,
+      lastAgentMessage: null,
+      lastAgentReply: null,
+      unrepliedMessages: [],
+      unrepliedCustomerMessages: [],
+      guidance: 'Hội thoại đã có nhân viên phụ trách tiếp quản (assignedTo). LLM BẮT BUỘC trả về NO_REPLY.'
+    };
+  }
 
   const rawList = Array.isArray(input) ? input : (input?.results || input?.messages || []);
   const sortedAsc = sortMessages(rawList, 'ASCENDING');
@@ -167,6 +218,29 @@ export function computeAntiDuplicationContext(input, optionsOrCurrentText = {}) 
   const lastCustomerMessage = customerMessages.length > 0 ? customerMessages[customerMessages.length - 1] : null;
   const lastAgentTime = lastAgentReply ? getMessageTimestamp(lastAgentReply) : 0;
   const lastAgentText = lastAgentReply ? getMessageText(lastAgentReply) : '';
+
+  // 3. Human Takeover Cooldown Check (default 30 mins)
+  const cooldownMs = (options.humanCooldownMinutes || 30) * 60 * 1000;
+  const humanAgentMessages = agentMessages.filter(isHumanAgentMessage);
+  const lastHumanAgentReply = humanAgentMessages.length > 0 ? humanAgentMessages[humanAgentMessages.length - 1] : null;
+  const lastHumanTime = lastHumanAgentReply ? getMessageTimestamp(lastHumanAgentReply) : 0;
+  const now = Date.now();
+
+  if (lastHumanAgentReply && (now - lastHumanTime) < cooldownMs) {
+    const elapsedMins = Math.max(0, Math.round((now - lastHumanTime) / (60 * 1000)));
+    const humanText = getMessageText(lastHumanAgentReply);
+    return {
+      allRecentCustomerMessagesAddressed: true,
+      needsReply: false,
+      recommendedAction: 'NO_REPLY',
+      reason: `Nhân viên hỗ trợ con người vừa tương tác trong cuộc hội thoại này cách đây ${elapsedMins} phút (trong thời gian tiếp quản 30 phút). AI Bot tuyệt đối không được chen ngang.`,
+      lastAgentMessage: { id: lastHumanAgentReply.id, text: humanText },
+      lastAgentReply: { id: lastHumanAgentReply.id, text: humanText },
+      unrepliedMessages: [],
+      unrepliedCustomerMessages: [],
+      guidance: `Nhân viên hỗ trợ (${lastHumanAgentReply.createdBy || 'Human Agent'}) đang trực tiếp trò chuyện với khách. LLM BẮT BUỘC trả về NO_REPLY.`
+    };
+  }
 
   // SIMULTANEOUS_TOLERANCE_MS: In real-time chat, messages sent within a few seconds of agent response
   // or before it are considered already addressed or near-simultaneous
@@ -629,9 +703,107 @@ runTest('Test Case 5D: Variety of Vietnamese burst continuation phrases recogniz
 });
 
 // ----------------------------------------------------------------------------
+// TEST CASE 6: Human Takeover, Thread Assignment & Status Guard
+// Validates prevention of AI interruption when human staff is active or assigned
+// ----------------------------------------------------------------------------
+console.log('\n--- 📌 TEST CASE 6: Human Takeover & Thread Assignment Guard ---');
+
+runTest('Test Case 6A: Thread assigned to human staff (assignedTo: "A-61685315")', () => {
+  const customerPendingMsg = {
+    id: 'cust-msg-99',
+    direction: 'INCOMING',
+    senders: [{ actorId: 'V-12345' }],
+    createdAt: new Date().toISOString(),
+    text: 'Shop còn hàng không ạ?'
+  };
+
+  const context = computeAntiDuplicationContext([customerPendingMsg], {
+    assignedTo: 'A-61685315'
+  });
+
+  assert.equal(context.needsReply, false, 'Should NEVER reply if thread is assigned to human staff');
+  assert.equal(context.recommendedAction, 'NO_REPLY');
+  assert.ok(context.reason.includes('A-61685315'));
+});
+
+runTest('Test Case 6B: Thread is closed (threadStatus: "CLOSED")', () => {
+  const customerPendingMsg = {
+    id: 'cust-msg-100',
+    direction: 'INCOMING',
+    senders: [{ actorId: 'V-12345' }],
+    createdAt: new Date().toISOString(),
+    text: 'Cảm ơn shop'
+  };
+
+  const context = computeAntiDuplicationContext([customerPendingMsg], {
+    threadStatus: 'CLOSED'
+  });
+
+  assert.equal(context.needsReply, false, 'Should NEVER reply to closed thread');
+  assert.equal(context.recommendedAction, 'NO_REPLY');
+  assert.ok(context.reason.includes('CLOSED'));
+});
+
+runTest('Test Case 6C: Human staff sent message via HubSpot web client 5 minutes ago (Takeover Cooldown)', () => {
+  const humanStaffMsg = {
+    id: 'staff-msg-1',
+    direction: 'OUTGOING',
+    createdBy: 'A-61685315',
+    client: { clientType: 'HUBSPOT' },
+    senders: [{ actorId: 'A-61685315' }],
+    createdAt: new Date(Date.now() - 5 * 60 * 1000).toISOString(),
+    text: 'Dạ bồ đợi tui kiểm tra kho một chút nhé'
+  };
+
+  const customerFollowupMsg = {
+    id: 'cust-msg-101',
+    direction: 'INCOMING',
+    createdBy: 'V-12345',
+    senders: [{ actorId: 'V-12345' }],
+    createdAt: new Date(Date.now() - 2 * 60 * 1000).toISOString(),
+    text: 'Mình lấy loại màu xanh dương nha bồ'
+  };
+
+  const context = computeAntiDuplicationContext([humanStaffMsg, customerFollowupMsg], {
+    humanCooldownMinutes: 30
+  });
+
+  assert.equal(context.needsReply, false, 'Human active within 30m takeover cooldown must suppress AI reply');
+  assert.equal(context.recommendedAction, 'NO_REPLY');
+  assert.ok(context.reason.includes('tiếp quản 30 phút') || context.reason.includes('Nhân viên hỗ trợ'));
+});
+
+runTest('Test Case 6D: Bot message (clientType: "INTEGRATION") does NOT trigger human takeover cooldown', () => {
+  const botMsg = {
+    id: 'bot-msg-1',
+    direction: 'OUTGOING',
+    createdBy: 'A-61685315',
+    client: { clientType: 'INTEGRATION' },
+    senders: [{ actorId: 'A-61685315' }],
+    createdAt: new Date(Date.now() - 10 * 60 * 1000).toISOString(),
+    text: 'Dạ chào bồ, bồ cần hỗ trợ gì hen?'
+  };
+
+  const customerNewInquiry = {
+    id: 'cust-msg-102',
+    direction: 'INCOMING',
+    createdBy: 'V-12345',
+    senders: [{ actorId: 'V-12345' }],
+    createdAt: new Date(Date.now() - 1 * 60 * 1000).toISOString(),
+    text: 'Mình muốn mua 10 acc Gmail'
+  };
+
+  const context = computeAntiDuplicationContext([botMsg, customerNewInquiry]);
+
+  assert.equal(context.needsReply, true, 'Bot reply does not trigger human cooldown; new customer inquiry requires reply');
+  assert.equal(context.recommendedAction, 'REPLY');
+});
+
+// ----------------------------------------------------------------------------
 // Summary
 // ----------------------------------------------------------------------------
 console.log('\n' + '='.repeat(75));
 console.log(`🏁 VERIFICATION COMPLETE: ${passCount}/${totalTests} Tests Passed (100% SUCCESS)`);
 console.log('='.repeat(75) + '\n');
+
 

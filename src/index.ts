@@ -2747,6 +2747,18 @@ function createServer({ config }: { config?: any } = {}) {
     return false
   }
 
+  function isHumanAgentMessage(msg: any): boolean {
+    if (!msg) return false
+    if (typeof msg.direction === 'string' && msg.direction.toUpperCase() === 'INCOMING') return false
+    const clientType = (msg.client?.clientType || '').toUpperCase()
+    if (clientType === 'HUBSPOT') return true
+    if (clientType === 'SYSTEM' && typeof msg.direction === 'string' && msg.direction.toUpperCase() === 'OUTGOING') return true
+    if (clientType === 'INTEGRATION') return false
+    const actorId = msg.senders?.[0]?.actorId || msg.createdBy || msg.actorId || ''
+    if (typeof actorId === 'string' && actorId.startsWith('A-')) return true
+    return false
+  }
+
   const CLOSING_PHRASES = [
     'oki', 'ok', 'oke', 'okie', 'ok nè', 'oki b an', 'oki bạn nè', 'oki bạn', 'oki b', 'ok b', 'ok bạn', 'ok shop', 'ok nhé', 'ok nha',
     'ạ', 'da', 'dạ', 'dạ vâng', 'vang', 'vâng', 'cảm ơn', 'cam on', 'cảm ơn bạn', 'cảm ơn shop',
@@ -2781,11 +2793,44 @@ function createServer({ config }: { config?: any } = {}) {
       targetMessageId?: string
       currentMessageText?: string
       enableAckDetection?: boolean
+      assignedTo?: string | null
+      threadStatus?: string | null
+      humanCooldownMinutes?: number
     } | string = {}
   ) {
     const options = typeof optionsOrCurrentText === 'string'
       ? { currentMessageText: optionsOrCurrentText }
       : (optionsOrCurrentText || {})
+
+    // 1. Thread Status Check: Never reply to closed conversations
+    if (options.threadStatus && options.threadStatus.toUpperCase() === 'CLOSED') {
+      return {
+        allRecentCustomerMessagesAddressed: true,
+        needsReply: false,
+        recommendedAction: 'NO_REPLY' as const,
+        reason: 'Hội thoại đã đóng (status: CLOSED). AI Bot không được gửi tin nhắn vào thread đã đóng.',
+        lastAgentMessage: null,
+        lastAgentReply: null,
+        unrepliedMessages: [],
+        unrepliedCustomerMessages: [],
+        guidance: 'Thread đã đóng. BẮT BUỘC trả về NO_REPLY.'
+      }
+    }
+
+    // 2. Thread Assignment Check: If thread is assigned to a human staff member
+    if (options.assignedTo && typeof options.assignedTo === 'string' && options.assignedTo.trim() !== '') {
+      return {
+        allRecentCustomerMessagesAddressed: true,
+        needsReply: false,
+        recommendedAction: 'NO_REPLY' as const,
+        reason: `Hội thoại này đã được phân công cho nhân viên hỗ trợ (${options.assignedTo}). AI Bot tuyệt đối không được chen ngang.`,
+        lastAgentMessage: null,
+        lastAgentReply: null,
+        unrepliedMessages: [],
+        unrepliedCustomerMessages: [],
+        guidance: 'Hội thoại đã có nhân viên phụ trách tiếp quản (assignedTo). LLM BẮT BUỘC trả về NO_REPLY.'
+      }
+    }
 
     const rawList = extractMessagesList(input)
     const sortedAsc = sortMessages(rawList, 'ASCENDING')
@@ -2805,6 +2850,29 @@ function createServer({ config }: { config?: any } = {}) {
     const lastCustomerMessage = customerMessages.length > 0 ? customerMessages[customerMessages.length - 1] : null
     const lastAgentTime = lastAgentReply ? getMessageTimestamp(lastAgentReply) : 0
     const lastAgentText = lastAgentReply ? getMessageText(lastAgentReply) : ''
+
+    // 3. Human Takeover Cooldown Check (default 30 mins)
+    const cooldownMs = (options.humanCooldownMinutes || 30) * 60 * 1000
+    const humanAgentMessages = agentMessages.filter(isHumanAgentMessage)
+    const lastHumanAgentReply = humanAgentMessages.length > 0 ? humanAgentMessages[humanAgentMessages.length - 1] : null
+    const lastHumanTime = lastHumanAgentReply ? getMessageTimestamp(lastHumanAgentReply) : 0
+    const now = Date.now()
+
+    if (lastHumanAgentReply && (now - lastHumanTime) < cooldownMs) {
+      const elapsedMins = Math.max(0, Math.round((now - lastHumanTime) / (60 * 1000)))
+      const humanText = getMessageText(lastHumanAgentReply)
+      return {
+        allRecentCustomerMessagesAddressed: true,
+        needsReply: false,
+        recommendedAction: 'NO_REPLY' as const,
+        reason: `Nhân viên hỗ trợ con người vừa tương tác trong cuộc hội thoại này cách đây ${elapsedMins} phút (trong thời gian tiếp quản 30 phút). AI Bot tuyệt đối không được chen ngang.`,
+        lastAgentMessage: { id: lastHumanAgentReply.id, text: humanText },
+        lastAgentReply: { id: lastHumanAgentReply.id, text: humanText },
+        unrepliedMessages: [],
+        unrepliedCustomerMessages: [],
+        guidance: `Nhân viên hỗ trợ (${lastHumanAgentReply.createdBy || 'Human Agent'}) đang trực tiếp trò chuyện với khách. LLM BẮT BUỘC trả về NO_REPLY.`
+      }
+    }
 
     // SIMULTANEOUS_TOLERANCE_MS: In real-time chat, messages sent within a few seconds of agent response
     // or before it are considered already addressed or near-simultaneous
@@ -3133,17 +3201,25 @@ function createServer({ config }: { config?: any } = {}) {
         return formatResponse(msgResult)
       }
       const sortedMsgResult = applySortToMessagesResult(msgResult, params.sort || 'DESCENDING')
-      const antiDuplicationContext = computeAntiDuplicationContext(sortedMsgResult, { enableAckDetection: true })
+      const antiDuplicationContext = computeAntiDuplicationContext(sortedMsgResult, {
+        enableAckDetection: true,
+        assignedTo: latestThread.assignedTo || null,
+        threadStatus: latestThread.status || null
+      })
 
       return formatResponse({
         notice: `Retrieved messages from latest active thread '${latestThread.id}' (channel: ${latestThread.originalChannelId}, contact VID: ${latestThread.associatedContactId}). All merged VIDs checked: ${allVids.join(', ')}. Total threads found: ${threads.length}.`,
         threadId: latestThread.id,
         channelId: latestThread.originalChannelId,
         associatedContactId: latestThread.associatedContactId,
+        assignedTo: latestThread.assignedTo || null,
+        threadStatus: latestThread.status || null,
         allThreads: threads.map((t: any) => ({
           threadId: t.id,
           associatedContactId: t.associatedContactId,
           channelId: t.originalChannelId,
+          assignedTo: t.assignedTo || null,
+          status: t.status || null,
           latestMessageTimestamp: t.latestMessageTimestamp
         })),
         messages: sortedMsgResult,
@@ -3154,13 +3230,25 @@ function createServer({ config }: { config?: any } = {}) {
 
   server.tool(
     "conversations_check_reply_needed",
-    "MANDATORY ANTI-DUPLICATION CHECK: Evaluate whether a conversation thread currently requires a reply from Agent/Bot or should return NO_REPLY. You MUST call this tool whenever a customer sends a short message (< 5 words), burst follow-up ('đây nha', 'nè bạn', 'xem giúp', 'ạ', 'dạ'), or when you are uncertain if the inquiry has already been answered. Analyzes recent incoming vs outgoing messages, compares timestamps, inspects the last agent message, and identifies unreplied customer inquiries.",
+    "MANDATORY PRE-REPLY GUARD: You MUST ALWAYS call this tool before generating any reply to a HubSpot live chat or messaging conversation, regardless of message length. Evaluates whether a human staff member is assigned or currently active, checks 30-minute takeover cooldown, prevents duplicate/burst echoes, and decides if NO_REPLY should be returned.",
     {
       threadId: z.string().describe("The HubSpot conversation thread ID (or Contact ID / Email for auto-resolution)"),
       currentMessageText: z.string().optional().describe("The incoming message text or candidate reply to check against the last sent agent message to avoid echoes or burst duplicates")
     },
     async (params) => handleEndpoint(async () => {
       let actualThreadId = params.threadId
+      let threadInfo: any = null
+
+      try {
+        const threadEndpoint = `/conversations/v3/conversations/threads/${actualThreadId}`
+        const threadRes = await makeApiRequest(hubspotAccessToken, threadEndpoint, {}, 'GET')
+        if (typeof threadRes === 'object' && threadRes !== null && !('error' in threadRes)) {
+          threadInfo = threadRes
+        }
+      } catch {
+        // Non-blocking fallback if thread lookup fails
+      }
+
       const msgEndpoint = `/conversations/v3/conversations/threads/${actualThreadId}/messages`
       let msgResult = await makeApiRequest(hubspotAccessToken, msgEndpoint, { limit: 20 }, 'GET')
 
@@ -3169,6 +3257,7 @@ function createServer({ config }: { config?: any } = {}) {
         const { threads: contactThreads } = await resolveThreadsForContact(hubspotAccessToken, params.threadId)
         if (contactThreads.length > 0) {
           actualThreadId = contactThreads[0].id
+          threadInfo = contactThreads[0]
           const resolvedEndpoint = `/conversations/v3/conversations/threads/${actualThreadId}/messages`
           msgResult = await makeApiRequest(hubspotAccessToken, resolvedEndpoint, { limit: 20 }, 'GET')
         } else {
@@ -3196,11 +3285,15 @@ function createServer({ config }: { config?: any } = {}) {
 
       const antiDup = computeAntiDuplicationContext(msgResult, {
         currentMessageText: params.currentMessageText,
-        enableAckDetection: true
+        enableAckDetection: true,
+        assignedTo: threadInfo?.assignedTo || null,
+        threadStatus: threadInfo?.status || null
       })
 
       return formatResponse({
         threadId: actualThreadId,
+        assignedTo: threadInfo?.assignedTo || null,
+        threadStatus: threadInfo?.status || null,
         needsReply: antiDup.needsReply,
         reason: antiDup.reason,
         recommendedAction: antiDup.recommendedAction,
